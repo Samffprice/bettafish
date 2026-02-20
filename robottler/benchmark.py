@@ -31,6 +31,12 @@ import multiprocessing as mp
 import os
 import time
 
+# Must be set BEFORE importing torch/numpy to prevent internal thread creation,
+# which deadlocks with fork()-based multiprocessing.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 from tqdm import tqdm
 
 from catanatron.game import Game, TURNS_LIMIT
