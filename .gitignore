@@ -1,0 +1,54 @@
+# Datasets (too large for git)
+datasets/
+
+# Game logs (may contain session metadata)
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+myenv/
+.venv/
+
+# Cython build artifacts
+*.so
+*.c
+!robottler/bitboard/_fast.pyx
+*.html
+
+# Training intermediates (large, reproducible)
+*.pt.training
+robottler/models/rl_checkpoints/
+robottler/models/gauntlet_results.csv
+robottler/models/*_log.csv
+
+# ONNX (reverted, not used)
+*.onnx
+*.onnx.data
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Task pipeline state
+.task/
+
+# uv
+.python-version
+
+# MCP config (local)
+.mcp.json
+
+# Claude config (local)
+.claude/

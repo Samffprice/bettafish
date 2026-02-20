@@ -1,0 +1,59 @@
+[project]
+name = "bettafish"
+version = "0.1.0"
+description = "AI Catan player — AlphaBeta search, MCTS, and AlphaZero on a fast bitboard engine"
+requires-python = ">=3.11"
+dependencies = [
+    # Game engine
+    "networkx>=3.0,<4.0",
+    "click",
+    "rich",
+    # Data / numerics
+    "numpy",
+    "pandas",
+    # ML
+    "torch>=2.0",
+    "scikit-learn",
+    # Async / networking (bridge)
+    "websockets==14.0",
+    "msgpack",
+    # Misc
+    "tqdm",
+]
+
+[project.optional-dependencies]
+rl = [
+    "stable-baselines3",
+    "sb3-contrib",
+    "gymnasium<=0.29.1",
+]
+cython = [
+    "cython",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-benchmark",
+    "coverage",
+]
+colab = [
+    "cython",
+    "stable-baselines3",
+    "sb3-contrib",
+    "gymnasium<=0.29.1",
+]
+
+[tool.uv.sources]
+# Catanatron is a local forked package
+catanatron = { path = "catanatron", editable = true }
+
+[tool.setuptools.packages.find]
+include = ["bridge*", "robottler*", "tests*"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
