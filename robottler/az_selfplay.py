@@ -945,7 +945,12 @@ def main():
     args = parser.parse_args()
 
     if hasattr(args, 'workers') and args.workers > 1:
-        mp.set_start_method("spawn", force=True)
+        # spawn is required for CUDA but very slow to start (~2-3 min for 15 workers).
+        # fork is instant and safe on CPU-only Linux.
+        if torch.cuda.is_available():
+            mp.set_start_method("spawn", force=True)
+        else:
+            mp.set_start_method("fork", force=True)
 
     if args.command == 'generate':
         records, stats = generate_games(

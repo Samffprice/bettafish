@@ -699,7 +699,11 @@ def main():
         parser.error("Specify --model, --rl-model, --search, --bb-search, --policy-search, --mcts, or --baselines (or combine)")
 
     if args.workers > 1:
-        mp.set_start_method("spawn", force=True)  # safe for PyTorch
+        import torch
+        if torch.cuda.is_available():
+            mp.set_start_method("spawn", force=True)
+        else:
+            mp.set_start_method("fork", force=True)
         print(f"Using {args.workers} parallel workers per matchup")
 
     all_results = []

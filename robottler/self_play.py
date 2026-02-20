@@ -225,7 +225,15 @@ def main():
     args = parser.parse_args()
 
     if args.workers > 1:
-        mp.set_start_method("spawn", force=True)
+        try:
+            import torch
+            has_cuda = torch.cuda.is_available()
+        except ImportError:
+            has_cuda = False
+        if has_cuda:
+            mp.set_start_method("spawn", force=True)
+        else:
+            mp.set_start_method("fork", force=True)
 
     generate_games(
         bc_model_path=args.bc_model,
