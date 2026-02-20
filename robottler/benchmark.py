@@ -27,6 +27,7 @@ Usage:
 import argparse
 import csv
 import math
+import multiprocessing as mp
 import os
 import time
 
@@ -111,12 +112,118 @@ def make_player(kind, color, rl_model_path=None, bc_model_path=None,
         raise ValueError(f"Unknown player kind: {kind}")
 
 
+# ---------------------------------------------------------------------------
+# Multiprocessing worker for parallel game execution
+# ---------------------------------------------------------------------------
+
+# Per-process globals (set by _worker_init)
+_worker_p1_kind = None
+_worker_p2_kind = None
+_worker_kwargs = None
+
+
+def _worker_init(p1_kind, p2_kind, kwargs):
+    """Initialize per-worker state. Called once per process.
+
+    We re-create value functions per-process since PyTorch models
+    can't be pickled across process boundaries.
+    """
+    global _worker_p1_kind, _worker_p2_kind, _worker_kwargs
+    _worker_p1_kind = p1_kind
+    _worker_p2_kind = p2_kind
+
+    # Re-build value_fn from paths in each worker (can't pickle torch models)
+    kw = dict(kwargs)
+    kw.pop("p1_value_fn", None)  # remove unpicklable value_fn
+    kw.pop("rl_model", None)
+    kw.pop("policy_fn", None)
+
+    # Rebuild value_fn from _rebuild_spec if provided
+    rebuild = kw.pop("_rebuild_spec", None)
+    if rebuild:
+        fn_type = rebuild["type"]
+        if fn_type == "blend":
+            from robottler.search_player import make_blended_value_fn
+            kw["p1_value_fn"] = make_blended_value_fn(
+                rebuild["bc_model_path"], blend_weight=rebuild["blend_weight"])
+        elif fn_type == "neural":
+            from robottler.value_model import load_value_model
+            kw["p1_value_fn"] = load_value_model(rebuild["bc_model_path"])
+        elif fn_type == "scaled_neural":
+            from robottler.search_player import make_scaled_neural_value_fn
+            kw["p1_value_fn"] = make_scaled_neural_value_fn(
+                rebuild["bc_model_path"], scale=rebuild["blend_weight"])
+        elif fn_type == "heuristic":
+            kw["p1_value_fn"] = base_fn(DEFAULT_WEIGHTS)
+        elif fn_type == "bb_neural":
+            from robottler.search_player import make_bb_neural_value_fn
+            kw["p1_value_fn"] = make_bb_neural_value_fn(rebuild["bc_model_path"])
+        elif fn_type == "bb_blend":
+            from robottler.search_player import make_bb_blended_value_fn
+            kw["p1_value_fn"] = make_bb_blended_value_fn(
+                rebuild["bc_model_path"], blend_weight=rebuild["blend_weight"])
+        elif fn_type == "rl_value":
+            from robottler.search_player import make_rl_value_fn
+            kw["p1_value_fn"] = make_rl_value_fn(
+                rebuild["rl_model_path"], rebuild["bc_model_path"])
+        elif fn_type == "rl_blend":
+            from robottler.search_player import make_rl_blended_value_fn
+            kw["p1_value_fn"] = make_rl_blended_value_fn(
+                rebuild["rl_model_path"], rebuild["bc_model_path"],
+                blend_weight=rebuild["blend_weight"])
+        elif fn_type == "mcts_neural":
+            from robottler.mcts_player import make_mcts_value_fn
+            kw["p1_value_fn"] = make_mcts_value_fn(rebuild["bc_model_path"])
+        elif fn_type == "mcts_blend":
+            from robottler.mcts_player import make_mcts_blend_value_fn
+            kw["p1_value_fn"] = make_mcts_blend_value_fn(
+                rebuild["bc_model_path"], blend_weight=rebuild["blend_weight"])
+        elif fn_type == "mcts_heuristic":
+            from robottler.mcts_player import make_mcts_heuristic_value_fn
+            kw["p1_value_fn"] = make_mcts_heuristic_value_fn()
+
+    _worker_kwargs = kw
+
+
+def _worker_play_one_game(_game_idx):
+    """Play a single game in a worker process. Returns (winner_color, vp_red, vp_blue, turns)."""
+    kw = _worker_kwargs
+    p1 = make_player(_worker_p1_kind, Color.RED,
+                     rl_model_path=kw.get("rl_model_path"),
+                     bc_model_path=kw.get("bc_model_path"),
+                     search_depth=kw.get("search_depth", 2),
+                     top_k=kw.get("top_k", 10),
+                     value_fn=kw.get("p1_value_fn"),
+                     prunning=kw.get("prunning", False),
+                     rl_model=kw.get("rl_model"),
+                     dice_sample_size=kw.get("dice_sample_size"),
+                     mcts_simulations=kw.get("mcts_simulations", 800),
+                     mcts_c_puct=kw.get("mcts_c_puct", 1.4),
+                     policy_fn=kw.get("policy_fn"))
+    p2 = make_player(_worker_p2_kind, Color.BLUE)
+
+    if kw.get("p1_value_fn") is not None and hasattr(p1, "_neural_value_fn") and _worker_p1_kind == "value":
+        p1._neural_value_fn = kw["p1_value_fn"]
+
+    game = Game([p1, p2], vps_to_win=kw.get("vps_to_win", 10))
+    game.play()
+
+    winner = game.winning_color()
+    vp_red = get_actual_victory_points(game.state, Color.RED)
+    vp_blue = get_actual_victory_points(game.state, Color.BLUE)
+    turns = game.state.num_turns
+    return (str(winner), vp_red, vp_blue, turns)
+
+
 def run_matchup(p1_kind, p2_kind, num_games, p1_value_fn=None, vps_to_win=10,
                 rl_model_path=None, bc_model_path=None,
                 search_depth=2, top_k=10, prunning=False, rl_model=None,
                 dice_sample_size=None, mcts_simulations=800, mcts_c_puct=1.4,
-                policy_fn=None):
+                policy_fn=None, workers=1, rebuild_spec=None):
     """Run num_games 1v1 games and return stats.
+
+    workers: number of parallel processes (1 = sequential, no multiprocessing overhead).
+    rebuild_spec: dict describing how to reconstruct value_fn in workers (for multiprocessing).
 
     Returns dict with: p1_wins, p2_wins, draws, p1_vps, p2_vps, turns, total
     """
@@ -128,37 +235,75 @@ def run_matchup(p1_kind, p2_kind, num_games, p1_value_fn=None, vps_to_win=10,
     turn_counts = []
 
     label = f"{p1_kind} vs {p2_kind}"
-    for _ in tqdm(range(num_games), desc=f"  {label}", leave=False):
-        p1 = make_player(p1_kind, Color.RED, rl_model_path, bc_model_path,
-                         search_depth=search_depth, top_k=top_k,
-                         value_fn=p1_value_fn, prunning=prunning,
-                         rl_model=rl_model, dice_sample_size=dice_sample_size,
-                         mcts_simulations=mcts_simulations, mcts_c_puct=mcts_c_puct,
-                         policy_fn=policy_fn)
-        p2 = make_player(p2_kind, Color.BLUE)
 
-        # Legacy injection for ValueFunctionPlayer (non-search players)
-        if p1_value_fn is not None and hasattr(p1, "_neural_value_fn") and p1_kind == "value":
-            p1._neural_value_fn = p1_value_fn
+    if workers <= 1:
+        # Sequential path — no multiprocessing overhead
+        for _ in tqdm(range(num_games), desc=f"  {label}", leave=False):
+            p1 = make_player(p1_kind, Color.RED, rl_model_path, bc_model_path,
+                             search_depth=search_depth, top_k=top_k,
+                             value_fn=p1_value_fn, prunning=prunning,
+                             rl_model=rl_model, dice_sample_size=dice_sample_size,
+                             mcts_simulations=mcts_simulations, mcts_c_puct=mcts_c_puct,
+                             policy_fn=policy_fn)
+            p2 = make_player(p2_kind, Color.BLUE)
 
-        game = Game([p1, p2], vps_to_win=vps_to_win)
-        game.play()
+            if p1_value_fn is not None and hasattr(p1, "_neural_value_fn") and p1_kind == "value":
+                p1._neural_value_fn = p1_value_fn
 
-        winner = game.winning_color()
-        vp_red = get_actual_victory_points(game.state, Color.RED)
-        vp_blue = get_actual_victory_points(game.state, Color.BLUE)
-        turns = game.state.num_turns
+            game = Game([p1, p2], vps_to_win=vps_to_win)
+            game.play()
 
-        p1_vps.append(vp_red)
-        p2_vps.append(vp_blue)
-        turn_counts.append(turns)
+            winner = game.winning_color()
+            vp_red = get_actual_victory_points(game.state, Color.RED)
+            vp_blue = get_actual_victory_points(game.state, Color.BLUE)
+            turns = game.state.num_turns
 
-        if winner is None or turns >= TURNS_LIMIT:
-            draws += 1
-        elif winner == Color.RED:
-            p1_wins += 1
-        else:
-            p2_wins += 1
+            p1_vps.append(vp_red)
+            p2_vps.append(vp_blue)
+            turn_counts.append(turns)
+
+            if winner is None or turns >= TURNS_LIMIT:
+                draws += 1
+            elif winner == Color.RED:
+                p1_wins += 1
+            else:
+                p2_wins += 1
+    else:
+        # Parallel path
+        init_kwargs = {
+            "bc_model_path": bc_model_path,
+            "rl_model_path": rl_model_path,
+            "search_depth": search_depth,
+            "top_k": top_k,
+            "prunning": prunning,
+            "dice_sample_size": dice_sample_size,
+            "mcts_simulations": mcts_simulations,
+            "mcts_c_puct": mcts_c_puct,
+            "vps_to_win": vps_to_win,
+        }
+        if rebuild_spec:
+            init_kwargs["_rebuild_spec"] = rebuild_spec
+
+        with mp.Pool(
+            processes=workers,
+            initializer=_worker_init,
+            initargs=(p1_kind, p2_kind, init_kwargs),
+        ) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(_worker_play_one_game, range(num_games)),
+                total=num_games, desc=f"  {label}", leave=False,
+            ))
+
+        for winner_str, vp_red, vp_blue, turns in results:
+            p1_vps.append(vp_red)
+            p2_vps.append(vp_blue)
+            turn_counts.append(turns)
+            if winner_str == "None" or turns >= TURNS_LIMIT:
+                draws += 1
+            elif winner_str == str(Color.RED):
+                p1_wins += 1
+            else:
+                p2_wins += 1
 
     return {
         "p1_kind": p1_kind,
@@ -267,7 +412,7 @@ def run_rl_gauntlet(rl_model_path, bc_model_path, num_games, vps_to_win=10):
 def run_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
                         rl_model_path=None, search_depth=2, top_k=10,
                         eval_mode="heuristic", blend_weight=1e10,
-                        use_policy=False, dice_sample_size=None):
+                        use_policy=False, dice_sample_size=None, workers=1):
     """Run search player against all opponents.
 
     eval_mode controls the leaf evaluation function:
@@ -289,6 +434,10 @@ def run_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
     from robottler.value_model import load_value_model
 
     label_parts = [f"depth={search_depth}", f"eval={eval_mode}"]
+
+    # Build rebuild_spec for multiprocessing (workers reconstruct value_fn from paths)
+    rebuild_spec = {"type": eval_mode, "bc_model_path": bc_model_path,
+                    "blend_weight": blend_weight, "rl_model_path": rl_model_path}
 
     if eval_mode == "heuristic":
         heuristic_fn = base_fn(DEFAULT_WEIGHTS)
@@ -337,6 +486,8 @@ def run_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
     opponents = ["random", "weighted", "value", "alphabeta"]
 
     results = []
+    if workers > 1:
+        label_parts.append(f"workers={workers}")
     print(f"\n{label} Gauntlet ({num_games} games each, 1v1, {vps_to_win} VP)")
     print("=" * 80)
 
@@ -349,6 +500,7 @@ def run_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
             rl_model_path=rl_model_path, bc_model_path=bc_model_path,
             search_depth=search_depth, top_k=top_k, rl_model=rl_model,
             dice_sample_size=dice_sample_size,
+            workers=workers, rebuild_spec=rebuild_spec,
         )
         results.append(result)
         print_result(result)
@@ -359,7 +511,7 @@ def run_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
 def run_mcts_gauntlet(bc_model_path, num_games, vps_to_win=10,
                       rl_model_path=None, mcts_simulations=800,
                       mcts_c_puct=1.4, eval_mode="neural",
-                      blend_weight=1e8, use_policy=False):
+                      blend_weight=1e8, use_policy=False, workers=1):
     """Run MCTS player against all opponents.
 
     eval_mode controls the value function:
@@ -375,6 +527,11 @@ def run_mcts_gauntlet(bc_model_path, num_games, vps_to_win=10,
     )
 
     label_parts = [f"sims={mcts_simulations}", f"c_puct={mcts_c_puct}", f"eval={eval_mode}"]
+
+    # Build rebuild_spec for multiprocessing
+    rebuild_type = f"mcts_{eval_mode}"
+    rebuild_spec = {"type": rebuild_type, "bc_model_path": bc_model_path,
+                    "blend_weight": blend_weight}
 
     if eval_mode == "neural":
         print(f"Loading BC model from {bc_model_path}...")
@@ -400,6 +557,8 @@ def run_mcts_gauntlet(bc_model_path, num_games, vps_to_win=10,
     opponents = ["random", "weighted", "value", "alphabeta"]
 
     results = []
+    if workers > 1:
+        label_parts.append(f"workers={workers}")
     print(f"\n{label} Gauntlet ({num_games} games each, 1v1, {vps_to_win} VP)")
     print("=" * 80)
 
@@ -409,6 +568,7 @@ def run_mcts_gauntlet(bc_model_path, num_games, vps_to_win=10,
             rl_model_path=rl_model_path, bc_model_path=bc_model_path,
             mcts_simulations=mcts_simulations, mcts_c_puct=mcts_c_puct,
             policy_fn=policy_fn,
+            workers=workers, rebuild_spec=rebuild_spec,
         )
         results.append(result)
         print_result(result)
@@ -416,7 +576,7 @@ def run_mcts_gauntlet(bc_model_path, num_games, vps_to_win=10,
     return results
 
 
-def run_baselines(num_games, vps_to_win=10):
+def run_baselines(num_games, vps_to_win=10, workers=1):
     """Run reference matchups between built-in players."""
     matchups = [
         ("random", "random"),
@@ -430,7 +590,8 @@ def run_baselines(num_games, vps_to_win=10):
     print("=" * 75)
 
     for p1_kind, p2_kind in matchups:
-        result = run_matchup(p1_kind, p2_kind, num_games, vps_to_win=vps_to_win)
+        result = run_matchup(p1_kind, p2_kind, num_games, vps_to_win=vps_to_win,
+                             workers=workers)
         results.append(result)
         print_result(result)
 
@@ -439,7 +600,7 @@ def run_baselines(num_games, vps_to_win=10):
 
 def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
                            search_depth=2, eval_mode="neural",
-                           blend_weight=1e10, dice_sample_size=None):
+                           blend_weight=1e10, dice_sample_size=None, workers=1):
     """Run bitboard search player against all opponents.
 
     eval_mode controls the leaf evaluation function:
@@ -449,6 +610,11 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
     from robottler.search_player import make_bb_neural_value_fn, make_bb_blended_value_fn
 
     label_parts = [f"depth={search_depth}", f"eval={eval_mode}"]
+
+    # Build rebuild_spec for multiprocessing
+    rebuild_type = "bb_neural" if eval_mode == "neural" else "bb_blend"
+    rebuild_spec = {"type": rebuild_type, "bc_model_path": bc_model_path,
+                    "blend_weight": blend_weight}
 
     if eval_mode == "neural":
         print(f"Loading BB neural value fn from {bc_model_path}...")
@@ -467,6 +633,8 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
         label_parts.append(f"dice={dice_sample_size}")
 
     results = []
+    if workers > 1:
+        label_parts.append(f"workers={workers}")
     print(f"\n{label} Gauntlet ({num_games} games each, 1v1, {vps_to_win} VP)")
     print("=" * 80)
 
@@ -476,6 +644,7 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
             bc_model_path=bc_model_path,
             search_depth=search_depth,
             dice_sample_size=dice_sample_size,
+            workers=workers, rebuild_spec=rebuild_spec,
         )
         results.append(result)
         print_result(result)
@@ -522,10 +691,16 @@ def main():
                         help="Number of games per matchup (default: 1000)")
     parser.add_argument("--vps", type=int, default=10,
                         help="Victory points to win (default: 10)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel worker processes per matchup (default: 1)")
     args = parser.parse_args()
 
     if not args.model and not args.rl_model and not args.search and not args.bb_search and not args.policy_search and not args.mcts and not args.baselines:
         parser.error("Specify --model, --rl-model, --search, --bb-search, --policy-search, --mcts, or --baselines (or combine)")
+
+    if args.workers > 1:
+        mp.set_start_method("spawn", force=True)  # safe for PyTorch
+        print(f"Using {args.workers} parallel workers per matchup")
 
     all_results = []
     start = time.time()
@@ -540,14 +715,16 @@ def main():
             search_depth=args.search_depth, top_k=args.top_k,
             eval_mode=args.eval_mode, blend_weight=args.blend_weight,
             use_policy=args.policy_search,
-            dice_sample_size=args.dice_sample))
+            dice_sample_size=args.dice_sample,
+            workers=args.workers))
 
     if args.bb_search:
         all_results.extend(run_bb_search_gauntlet(
             args.bc_model, args.games, vps_to_win=args.vps,
             search_depth=args.search_depth,
             eval_mode=args.eval_mode, blend_weight=args.blend_weight,
-            dice_sample_size=args.dice_sample))
+            dice_sample_size=args.dice_sample,
+            workers=args.workers))
     elif args.rl_model:
         all_results.extend(run_rl_gauntlet(
             args.rl_model, args.bc_model, args.games, vps_to_win=args.vps))
@@ -560,10 +737,12 @@ def main():
             rl_model_path=args.rl_model,
             mcts_simulations=args.simulations, mcts_c_puct=args.c_puct,
             eval_mode=mcts_eval, blend_weight=args.blend_weight,
-            use_policy=args.mcts_policy))
+            use_policy=args.mcts_policy,
+            workers=args.workers))
 
     if args.baselines:
-        all_results.extend(run_baselines(args.games, vps_to_win=args.vps))
+        all_results.extend(run_baselines(args.games, vps_to_win=args.vps,
+                                         workers=args.workers))
 
     elapsed = time.time() - start
     print(f"\nCompleted in {elapsed:.0f}s")

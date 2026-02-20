@@ -1,7 +1,7 @@
 """Generate training data from search-vs-search self-play games.
 
 Records (features, outcome) pairs for value function retraining.
-Uses ThreadPoolExecutor for parallel game generation.
+Uses multiprocessing for parallel game generation.
 
 Usage:
     # Quick smoke test (10 games)
@@ -10,19 +10,19 @@ Usage:
         --games 10 --depth 2 --workers 1 \
         --output-dir datasets/selfplay_test
 
-    # Full run (1k games)
+    # Full run (1k games, 8 cores)
     python3 -m robottler.self_play \
         --bc-model robottler/models/value_net_v2.pt \
-        --games 1000 --depth 2 --workers 4 \
+        --games 1000 --depth 2 --workers 8 \
         --output-dir datasets/selfplay
 """
 
 import argparse
+import multiprocessing as mp
 import os
 import random
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -92,6 +92,38 @@ def play_one_game(value_fn, depth, prunning, game_id, vps_to_win=10):
     }
 
 
+# ---------------------------------------------------------------------------
+# Multiprocessing worker for parallel self-play
+# ---------------------------------------------------------------------------
+
+_sp_worker_value_fn = None
+_sp_worker_depth = None
+_sp_worker_prunning = None
+_sp_worker_vps = None
+
+
+def _sp_worker_init(bc_model_path, blend_weight, eval_mode, depth, prunning, vps_to_win):
+    """Initialize per-worker state: load value function."""
+    global _sp_worker_value_fn, _sp_worker_depth, _sp_worker_prunning, _sp_worker_vps
+    from robottler.search_player import make_blended_value_fn
+    from robottler.value_model import load_value_model
+
+    if eval_mode == "blend":
+        _sp_worker_value_fn = make_blended_value_fn(bc_model_path, blend_weight=blend_weight)
+    else:
+        _sp_worker_value_fn = load_value_model(bc_model_path)
+
+    _sp_worker_depth = depth
+    _sp_worker_prunning = prunning
+    _sp_worker_vps = vps_to_win
+
+
+def _sp_worker_play(game_id):
+    """Play one game in a worker process."""
+    return play_one_game(_sp_worker_value_fn, _sp_worker_depth,
+                         _sp_worker_prunning, game_id, _sp_worker_vps)
+
+
 def generate_games(bc_model_path, num_games, depth, workers, output_dir,
                    prunning=False, vps_to_win=10, blend_weight=1e8,
                    eval_mode="blend", shard_size=500):
@@ -100,13 +132,6 @@ def generate_games(bc_model_path, num_games, depth, workers, output_dir,
     from robottler.value_model import load_value_model
 
     os.makedirs(output_dir, exist_ok=True)
-
-    if eval_mode == "blend":
-        print(f"Loading blend value fn (weight={blend_weight:.0e}) from {bc_model_path}...")
-        value_fn = make_blended_value_fn(bc_model_path, blend_weight=blend_weight)
-    else:
-        print(f"Loading neural value fn from {bc_model_path}...")
-        value_fn = load_value_model(bc_model_path)
 
     game_ids = [f"sp_{uuid.uuid4().hex[:12]}" for _ in range(num_games)]
 
@@ -128,6 +153,13 @@ def generate_games(bc_model_path, num_games, depth, workers, output_dir,
     print(f"Generating {num_games} self-play games (depth={depth}, workers={workers})...")
 
     if workers <= 1:
+        if eval_mode == "blend":
+            print(f"Loading blend value fn (weight={blend_weight:.0e}) from {bc_model_path}...")
+            value_fn = make_blended_value_fn(bc_model_path, blend_weight=blend_weight)
+        else:
+            print(f"Loading neural value fn from {bc_model_path}...")
+            value_fn = load_value_model(bc_model_path)
+
         for i, gid in enumerate(tqdm(game_ids, desc="Self-play")):
             records, stats = play_one_game(value_fn, depth, prunning, gid, vps_to_win)
             all_records.extend(records)
@@ -137,22 +169,24 @@ def generate_games(bc_model_path, num_games, depth, workers, output_dir,
                 flush_shard(all_records)
                 all_records = []
     else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(play_one_game, value_fn, depth, prunning, gid, vps_to_win): gid
-                for gid in game_ids
-            }
-            pbar = tqdm(total=num_games, desc="Self-play")
-            for future in as_completed(futures):
-                records, stats = future.result()
-                all_records.extend(records)
-                game_stats.append(stats)
-                pbar.update(1)
+        print(f"Using {workers} parallel workers")
+        with mp.Pool(
+            processes=workers,
+            initializer=_sp_worker_init,
+            initargs=(bc_model_path, blend_weight, eval_mode, depth, prunning, vps_to_win),
+        ) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(_sp_worker_play, game_ids),
+                total=num_games, desc="Self-play",
+            ))
 
-                if len(all_records) >= shard_size * 100:
-                    flush_shard(all_records)
-                    all_records = []
-            pbar.close()
+        for records, stats in results:
+            all_records.extend(records)
+            game_stats.append(stats)
+
+            if len(all_records) >= shard_size * 100:
+                flush_shard(all_records)
+                all_records = []
 
     flush_shard(all_records)
 
@@ -189,6 +223,9 @@ def main():
     parser.add_argument("--prunning", action="store_true",
                         help="Enable search pruning (default: disabled, which is stronger)")
     args = parser.parse_args()
+
+    if args.workers > 1:
+        mp.set_start_method("spawn", force=True)
 
     generate_games(
         bc_model_path=args.bc_model,

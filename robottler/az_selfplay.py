@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import time
 
@@ -325,28 +326,67 @@ def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
     return records, winner, game.state.num_turns
 
 
+# ---------------------------------------------------------------------------
+# Multiprocessing worker for parallel self-play
+# ---------------------------------------------------------------------------
+
+_az_worker_net = None
+_az_worker_fi = None
+_az_worker_means = None
+_az_worker_stds = None
+_az_worker_kwargs = None
+
+
+def _az_worker_init(checkpoint_path, num_simulations, c_puct,
+                    temperature_threshold, vps_to_win):
+    """Initialize per-worker state: load model, build FeatureIndexer."""
+    global _az_worker_net, _az_worker_fi, _az_worker_means, _az_worker_stds, _az_worker_kwargs
+
+    net, ckpt = load_checkpoint(checkpoint_path)
+    feat_names = ckpt['feature_names']
+    _az_worker_means = ckpt['feature_means']
+    _az_worker_stds = ckpt['feature_stds']
+    feature_index_map = {name: i for i, name in enumerate(feat_names)}
+
+    from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
+    catan_map = build_map(BASE_MAP_TEMPLATE)
+    _az_worker_fi = FeatureIndexer(feature_index_map, catan_map)
+    _az_worker_net = net
+    _az_worker_kwargs = {
+        'num_simulations': num_simulations,
+        'c_puct': c_puct,
+        'temperature_threshold': temperature_threshold,
+        'vps_to_win': vps_to_win,
+    }
+
+
+def _az_worker_play_one(_game_idx):
+    """Play one self-play game in a worker. Returns (features_list, policies_list, values_list, winner_str, turns)."""
+    records, winner, turns = generate_one_game_v2(
+        _az_worker_net, _az_worker_fi, _az_worker_means, _az_worker_stds,
+        **_az_worker_kwargs,
+    )
+    # Pack records into numpy arrays for pickling efficiency
+    features = [r.features for r in records]
+    policies = [r.policy_target for r in records]
+    values = [r.value_target for r in records]
+    return (features, policies, values, str(winner), turns)
+
+
 def generate_games(checkpoint_path, num_games, num_simulations=400,
                    c_puct=1.4, temperature_threshold=15, vps_to_win=10,
-                   output_dir=None):
+                   output_dir=None, workers=1):
     """Generate multiple self-play games with incremental saving.
 
     If output_dir is provided, saves after every game so progress survives
     interruption. On resume, skips already-completed games.
 
+    workers: number of parallel processes (1 = sequential).
+
     Returns:
         all_records: list of SelfPlayRecord
         stats: dict with game statistics
     """
-    net, ckpt = load_checkpoint(checkpoint_path)
-    feat_names = ckpt['feature_names']
-    feat_means = ckpt['feature_means']
-    feat_stds = ckpt['feature_stds']
-    feature_index_map = {name: i for i, name in enumerate(feat_names)}
-
-    from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
-    catan_map = build_map(BASE_MAP_TEMPLATE)
-    fi = FeatureIndexer(feature_index_map, catan_map)
-
     # Check for existing progress
     start_game = 0
     all_records = []
@@ -365,12 +405,10 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
                 if k in ('None', 'null'):
                     winners[None] = v
                 else:
-                    # Handle both "RED" and "Color.RED" formats
                     name = k.replace('Color.', '') if k.startswith('Color.') else k
                     winners[Color[name]] = v
             if start_game >= num_games:
                 print(f"  Already completed {start_game}/{num_games} games, skipping")
-                # Load existing records
                 if os.path.exists(os.path.join(output_dir, 'features.npy')):
                     feats, pols, vals = load_records(output_dir)
                     for i in range(len(vals)):
@@ -390,25 +428,74 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
                     for i in range(len(vals)):
                         all_records.append(SelfPlayRecord(feats[i], pols[i], vals[i]))
 
-    for i in tqdm(range(start_game, num_games), desc="Self-play",
-                  initial=start_game, total=num_games):
-        records, winner, turns = generate_one_game_v2(
-            net, fi, feat_means, feat_stds,
-            num_simulations=num_simulations,
-            c_puct=c_puct,
-            temperature_threshold=temperature_threshold,
-            vps_to_win=vps_to_win,
-        )
-        all_records.extend(records)
-        total_turns += turns
-        winners[winner] = winners.get(winner, 0) + 1
+    remaining = num_games - start_game
 
-        # Save incrementally
+    if workers <= 1:
+        # Sequential path — load model once
+        net, ckpt = load_checkpoint(checkpoint_path)
+        feat_names = ckpt['feature_names']
+        feat_means = ckpt['feature_means']
+        feat_stds = ckpt['feature_stds']
+        feature_index_map = {name: i for i, name in enumerate(feat_names)}
+
+        from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
+        catan_map = build_map(BASE_MAP_TEMPLATE)
+        fi = FeatureIndexer(feature_index_map, catan_map)
+
+        for i in tqdm(range(start_game, num_games), desc="Self-play",
+                      initial=start_game, total=num_games):
+            records, winner, turns = generate_one_game_v2(
+                net, fi, feat_means, feat_stds,
+                num_simulations=num_simulations,
+                c_puct=c_puct,
+                temperature_threshold=temperature_threshold,
+                vps_to_win=vps_to_win,
+            )
+            all_records.extend(records)
+            total_turns += turns
+            winners[winner] = winners.get(winner, 0) + 1
+
+            if output_dir is not None:
+                save_records(all_records, output_dir, quiet=True)
+                with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
+                    json.dump({
+                        'games_completed': i + 1,
+                        'total_games': num_games,
+                        'total_turns': total_turns,
+                        'total_records': len(all_records),
+                        'winners': {str(k): v for k, v in winners.items()},
+                        'checkpoint': checkpoint_path,
+                    }, f)
+    else:
+        # Parallel path — each worker loads its own model
+        print(f"Using {workers} parallel workers for self-play generation")
+        with mp.Pool(
+            processes=workers,
+            initializer=_az_worker_init,
+            initargs=(checkpoint_path, num_simulations, c_puct,
+                      temperature_threshold, vps_to_win),
+        ) as pool:
+            game_results = list(tqdm(
+                pool.imap_unordered(_az_worker_play_one, range(remaining)),
+                total=remaining, desc="Self-play", initial=start_game,
+            ))
+
+        for features_list, policies_list, values_list, winner_str, turns in game_results:
+            for feat, pol, val in zip(features_list, policies_list, values_list):
+                all_records.append(SelfPlayRecord(feat, pol, val))
+            total_turns += turns
+            if winner_str in ('None', 'null'):
+                winners[None] = winners.get(None, 0) + 1
+            else:
+                name = winner_str.replace('Color.', '') if winner_str.startswith('Color.') else winner_str
+                winners[Color[name]] = winners.get(Color[name], 0) + 1
+
+        # Save all at once after parallel generation
         if output_dir is not None:
             save_records(all_records, output_dir, quiet=True)
             with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
                 json.dump({
-                    'games_completed': i + 1,
+                    'games_completed': num_games,
                     'total_games': num_games,
                     'total_turns': total_turns,
                     'total_records': len(all_records),
@@ -679,7 +766,7 @@ def _save_loop_state(output_dir, state):
 
 def run_loop(start_checkpoint, iterations, games_per_iter, num_simulations,
              output_dir, c_puct=1.4, epochs=20, batch_size=256, lr=1e-3,
-             eval_games=100, accept_threshold=0.55, window_size=5):
+             eval_games=100, accept_threshold=0.55, window_size=5, workers=1):
     """Run the full AlphaZero training loop. Fully resumable.
 
     State is persisted to output_dir/_loop_state.json after each step.
@@ -730,7 +817,7 @@ def run_loop(start_checkpoint, iterations, games_per_iter, num_simulations,
             records, stats = generate_games(
                 current_best, games_per_iter,
                 num_simulations=num_simulations, c_puct=c_puct,
-                output_dir=iter_data_dir,
+                output_dir=iter_data_dir, workers=workers,
             )
             # Final save with summary
             save_records(records, iter_data_dir)
@@ -823,6 +910,8 @@ def main():
     gen_parser.add_argument('--sims', type=int, default=400)
     gen_parser.add_argument('--c-puct', type=float, default=1.4)
     gen_parser.add_argument('--output-dir', required=True)
+    gen_parser.add_argument('--workers', type=int, default=1,
+                            help='Parallel worker processes (default: 1)')
 
     # Train
     train_parser = subparsers.add_parser('train', help='Train on self-play data')
@@ -850,14 +939,20 @@ def main():
     loop_parser.add_argument('--output-dir', required=True)
     loop_parser.add_argument('--epochs', type=int, default=20)
     loop_parser.add_argument('--eval-games', type=int, default=100)
+    loop_parser.add_argument('--workers', type=int, default=1,
+                             help='Parallel worker processes (default: 1)')
 
     args = parser.parse_args()
+
+    if hasattr(args, 'workers') and args.workers > 1:
+        mp.set_start_method("spawn", force=True)
 
     if args.command == 'generate':
         records, stats = generate_games(
             args.checkpoint, args.games,
             num_simulations=args.sims, c_puct=args.c_puct,
             output_dir=args.output_dir,
+            workers=args.workers,
         )
         save_records(records, args.output_dir)
         print(f"Stats: {stats}")
@@ -881,6 +976,7 @@ def main():
             args.games_per_iter, args.sims,
             args.output_dir,
             epochs=args.epochs, eval_games=args.eval_games,
+            workers=args.workers,
         )
 
     else:
