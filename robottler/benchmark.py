@@ -161,6 +161,9 @@ def _worker_init(p1_kind, p2_kind, kwargs):
                 rebuild["bc_model_path"], scale=rebuild["blend_weight"])
         elif fn_type == "heuristic":
             kw["p1_value_fn"] = base_fn(DEFAULT_WEIGHTS)
+        elif fn_type == "bb_heuristic":
+            from robottler.search_player import make_bb_heuristic_value_fn
+            kw["p1_value_fn"] = make_bb_heuristic_value_fn()
         elif fn_type == "bb_neural":
             from robottler.search_player import make_bb_neural_value_fn
             kw["p1_value_fn"] = make_bb_neural_value_fn(rebuild["bc_model_path"])
@@ -211,6 +214,11 @@ def _worker_play_one_game(_game_idx):
     if kw.get("p1_value_fn") is not None and hasattr(p1, "_neural_value_fn") and _worker_p1_kind == "value":
         p1._neural_value_fn = kw["p1_value_fn"]
 
+    if kw.get("imperfect_info"):
+        from robottler.fog_of_war import FogOfWarPlayer
+        use_counting = kw.get("use_counting", True)
+        p1 = FogOfWarPlayer(p1, use_counting=use_counting)
+
     game = Game([p1, p2], vps_to_win=kw.get("vps_to_win", 10))
     game.play()
 
@@ -225,7 +233,8 @@ def run_matchup(p1_kind, p2_kind, num_games, p1_value_fn=None, vps_to_win=10,
                 rl_model_path=None, bc_model_path=None,
                 search_depth=2, top_k=10, prunning=False, rl_model=None,
                 dice_sample_size=None, mcts_simulations=800, mcts_c_puct=1.4,
-                policy_fn=None, workers=1, rebuild_spec=None):
+                policy_fn=None, workers=1, rebuild_spec=None,
+                imperfect_info=False, use_counting=True):
     """Run num_games 1v1 games and return stats.
 
     workers: number of parallel processes (1 = sequential, no multiprocessing overhead).
@@ -255,6 +264,10 @@ def run_matchup(p1_kind, p2_kind, num_games, p1_value_fn=None, vps_to_win=10,
 
             if p1_value_fn is not None and hasattr(p1, "_neural_value_fn") and p1_kind == "value":
                 p1._neural_value_fn = p1_value_fn
+
+            if imperfect_info:
+                from robottler.fog_of_war import FogOfWarPlayer
+                p1 = FogOfWarPlayer(p1, use_counting=use_counting)
 
             game = Game([p1, p2], vps_to_win=vps_to_win)
             game.play()
@@ -286,6 +299,8 @@ def run_matchup(p1_kind, p2_kind, num_games, p1_value_fn=None, vps_to_win=10,
             "mcts_simulations": mcts_simulations,
             "mcts_c_puct": mcts_c_puct,
             "vps_to_win": vps_to_win,
+            "imperfect_info": imperfect_info,
+            "use_counting": use_counting,
         }
         if rebuild_spec:
             init_kwargs["_rebuild_spec"] = rebuild_spec
@@ -418,7 +433,8 @@ def run_rl_gauntlet(rl_model_path, bc_model_path, num_games, vps_to_win=10):
 def run_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
                         rl_model_path=None, search_depth=2, top_k=10,
                         eval_mode="heuristic", blend_weight=1e10,
-                        use_policy=False, dice_sample_size=None, workers=1):
+                        use_policy=False, dice_sample_size=None, workers=1,
+                        imperfect_info=False, use_counting=True):
     """Run search player against all opponents.
 
     eval_mode controls the leaf evaluation function:
@@ -507,6 +523,7 @@ def run_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
             search_depth=search_depth, top_k=top_k, rl_model=rl_model,
             dice_sample_size=dice_sample_size,
             workers=workers, rebuild_spec=rebuild_spec,
+            imperfect_info=imperfect_info, use_counting=use_counting,
         )
         results.append(result)
         print_result(result)
@@ -606,23 +623,32 @@ def run_baselines(num_games, vps_to_win=10, workers=1):
 
 def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
                            search_depth=2, eval_mode="neural",
-                           blend_weight=1e10, dice_sample_size=None, workers=1):
+                           blend_weight=1e10, dice_sample_size=None, workers=1,
+                           imperfect_info=False, use_counting=True):
     """Run bitboard search player against all opponents.
 
     eval_mode controls the leaf evaluation function:
       - "neural": pure BC neural value function (default for bitboard)
       - "blend": heuristic + blend_weight * neural
     """
-    from robottler.search_player import make_bb_neural_value_fn, make_bb_blended_value_fn
+    from robottler.search_player import make_bb_neural_value_fn, make_bb_blended_value_fn, make_bb_heuristic_value_fn
 
     label_parts = [f"depth={search_depth}", f"eval={eval_mode}"]
 
     # Build rebuild_spec for multiprocessing
-    rebuild_type = "bb_neural" if eval_mode == "neural" else "bb_blend"
+    if eval_mode == "heuristic":
+        rebuild_type = "bb_heuristic"
+    elif eval_mode == "neural":
+        rebuild_type = "bb_neural"
+    else:
+        rebuild_type = "bb_blend"
     rebuild_spec = {"type": rebuild_type, "bc_model_path": bc_model_path,
                     "blend_weight": blend_weight}
 
-    if eval_mode == "neural":
+    if eval_mode == "heuristic":
+        print(f"Loading BB pure heuristic value fn...")
+        value_fn = make_bb_heuristic_value_fn()
+    elif eval_mode == "neural":
         print(f"Loading BB neural value fn from {bc_model_path}...")
         value_fn = make_bb_neural_value_fn(bc_model_path)
     elif eval_mode == "blend":
@@ -631,6 +657,9 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
         label_parts.append(f"weight={blend_weight:.0e}")
     else:
         raise ValueError(f"Unsupported eval_mode for bb_search: {eval_mode}")
+
+    if imperfect_info:
+        label_parts.append("fog" + ("" if use_counting else "-nocounting"))
 
     label = f"BB-Search ({', '.join(label_parts)})"
     opponents = ["random", "weighted", "value", "alphabeta"]
@@ -651,6 +680,7 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
             search_depth=search_depth,
             dice_sample_size=dice_sample_size,
             workers=workers, rebuild_spec=rebuild_spec,
+            imperfect_info=imperfect_info, use_counting=use_counting,
         )
         results.append(result)
         print_result(result)
@@ -699,6 +729,10 @@ def main():
                         help="Victory points to win (default: 10)")
     parser.add_argument("--workers", type=int, default=1,
                         help="Parallel worker processes per matchup (default: 1)")
+    parser.add_argument("--imperfect-info", action="store_true",
+                        help="Wrap P1 in fog-of-war (hide opponent hands, use card counting)")
+    parser.add_argument("--no-counting", action="store_true",
+                        help="With --imperfect-info, disable card counting (distribute total evenly)")
     args = parser.parse_args()
 
     if not args.model and not args.rl_model and not args.search and not args.bb_search and not args.policy_search and not args.mcts and not args.baselines:
@@ -726,7 +760,9 @@ def main():
             eval_mode=args.eval_mode, blend_weight=args.blend_weight,
             use_policy=args.policy_search,
             dice_sample_size=args.dice_sample,
-            workers=args.workers))
+            workers=args.workers,
+            imperfect_info=args.imperfect_info,
+            use_counting=not args.no_counting))
 
     if args.bb_search:
         all_results.extend(run_bb_search_gauntlet(
@@ -734,7 +770,9 @@ def main():
             search_depth=args.search_depth,
             eval_mode=args.eval_mode, blend_weight=args.blend_weight,
             dice_sample_size=args.dice_sample,
-            workers=args.workers))
+            workers=args.workers,
+            imperfect_info=args.imperfect_info,
+            use_counting=not args.no_counting))
     elif args.rl_model:
         all_results.extend(run_rl_gauntlet(
             args.rl_model, args.bc_model, args.games, vps_to_win=args.vps))

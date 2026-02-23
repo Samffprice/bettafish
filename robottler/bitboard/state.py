@@ -135,6 +135,9 @@ class BitboardState:
 
         # Trade state (simplified — search doesn't do domestic trades)
         'is_resolving_trade',  # bool
+
+        # Friendly robber (1v1: can't rob players with < 3 visible VP)
+        'friendly_robber',  # bool
     ]
 
     def __init__(self, num_players=2):
@@ -186,6 +189,7 @@ class BitboardState:
 
         self.zobrist_hash = np.uint64(0)
         self.is_resolving_trade = False
+        self.friendly_robber = False
 
     def copy(self):
         """Fast copy — numpy .copy() for arrays, scalars assigned directly."""
@@ -237,6 +241,7 @@ class BitboardState:
 
         s.zobrist_hash = self.zobrist_hash
         s.is_resolving_trade = self.is_resolving_trade
+        s.friendly_robber = self.friendly_robber
 
         return s
 

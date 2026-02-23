@@ -200,6 +200,7 @@ def game_to_bitboard(game):
     bb.is_road_building = state.is_road_building
     bb.free_roads = state.free_roads_available
     bb.is_resolving_trade = state.is_resolving_trade
+    bb.friendly_robber = getattr(state, "friendly_robber", False)
     bb.current_prompt = _ACTION_PROMPT_TO_INT[state.current_prompt]
 
     # Rebuild connected components from scratch

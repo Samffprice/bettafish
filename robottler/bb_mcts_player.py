@@ -164,7 +164,8 @@ class BBMCTSPlayer(Player):
     def __init__(self, color, az_net, feature_indexer, feature_means, feature_stds,
                  num_simulations=800, c_puct=1.4, time_limit=None,
                  dirichlet_alpha=0.3, dirichlet_weight=0.25,
-                 temperature=0.0, is_bot=True, leaf_value_fn=None):
+                 temperature=0.0, is_bot=True, leaf_value_fn=None,
+                 leaf_use_policy=True):
         super().__init__(color, is_bot)
         self.az_net = az_net
         self.fi = feature_indexer
@@ -178,6 +179,7 @@ class BBMCTSPlayer(Player):
         self.dirichlet_weight = dirichlet_weight
         self.temperature = temperature
         self.leaf_value_fn = leaf_value_fn
+        self.leaf_use_policy = leaf_use_policy
 
         # Pre-allocate buffers
         self._feat_buf = np.zeros(self.n_features, dtype=np.float32)
@@ -269,22 +271,19 @@ class BBMCTSPlayer(Player):
         """
         bb = node.bb_state
 
-        # --- External leaf value function path (blend bootstrap) ---
-        if self.leaf_value_fn is not None:
+        # --- External value + uniform priors (for blend-bootstrap self-play) ---
+        if self.leaf_value_fn is not None and not self.leaf_use_policy:
             value = self.leaf_value_fn(bb, self.color)
-
-            # Uniform priors — no trained policy available
             uniform = 1.0 / len(actions) if actions else 0.0
             node.children = []
             for action in actions:
                 child = BBMCTSNode(None, parent=node, action=action, prior=uniform)
                 node.children.append((action, child))
-
             node.is_expanded = True
             node._cached_actions = None
             return value
 
-        # --- Standard AZ network path ---
+        # --- Standard AZ network path (leaf_value_fn overrides value below if set) ---
 
         # Extract features into pre-allocated buffer
         self._feat_buf[:] = 0.0
@@ -315,6 +314,10 @@ class BBMCTSPlayer(Player):
             value, policy = self.az_net.predict(ft, mt)
 
         value = value.item()
+
+        # Override value with external leaf function (keep AZ policy priors)
+        if self.leaf_value_fn is not None:
+            value = self.leaf_value_fn(bb, self.color)
         policy_np = policy[0].numpy()
 
         # Build children with priors from the SAME index pass

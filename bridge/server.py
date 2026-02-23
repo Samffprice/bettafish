@@ -59,6 +59,7 @@ from bridge.config import (
     COLONIST_TURN_STATE_PLAY,
     COLONIST_TURN_STATE_GAME_OVER,
     TRADE_RESPONSE_PENDING,
+    TRADE_RESPONSE_ACCEPT,
     MSG_TYPE_AVAILABLE_SETTLEMENTS,
     MSG_TYPE_AVAILABLE_ROADS,
     MSG_TYPE_AVAILABLE_CITIES,
@@ -68,6 +69,7 @@ from bridge.config import (
     ANTICHEAT_ACTION_INTERVAL_MS,
     ACTION_BUILD_ROAD_DEV,
 )
+from bridge.card_tracker import OpponentCardTracker
 from catanatron.models.enums import ActionType, DEVELOPMENT_CARDS, SETTLEMENT, ROAD
 
 logger = logging.getLogger(__name__)
@@ -79,7 +81,8 @@ class BridgeServer:
     def __init__(self, bot_type: str = "value", anticheat: bool = None,
                  search_depth: int = 2, blend_weight: float = 1e8,
                  bc_model_path: str = "robottler/models/value_net_v2.pt",
-                 trade_strategy: str = "blend"):
+                 trade_strategy: str = "blend",
+                 propose_trades: bool = False):
         self.translator = StateTranslator()
         self.action_translator: Optional[ActionTranslator] = None
         self.bot = BotInterface(
@@ -88,6 +91,7 @@ class BridgeServer:
             trade_strategy=trade_strategy,
         )
         self.game_logger = GameLogger()
+        self.card_tracker = OpponentCardTracker()
         self.queue: asyncio.Queue = asyncio.Queue()
 
         # Pending multi-step action state
@@ -123,6 +127,14 @@ class BridgeServer:
 
         # Trade state tracking
         self._active_trade_offers: Dict[str, Dict] = {}
+
+        # Trade proposal (outbound) — only active when --propose-trades is set
+        self._propose_trades = propose_trades
+        self._pending_our_trade: bool = False
+        self._trade_proposal_time: float = 0.0
+        self._trade_proposed_this_turn: bool = False
+        self._first_accept_time: float = 0.0
+        self._pending_trade_proposal: Optional[Dict] = None  # cached proposal for acceptee eval
 
         # Active websocket connection (reject duplicates)
         self._active_ws = None
@@ -283,6 +295,9 @@ class BridgeServer:
 
         elif isinstance(msg, ResourceDistributionMsg):
             self.translator.update_resources_from_distribution(msg.distributions)
+            self.card_tracker.on_resource_distribution(
+                msg.distributions, self.translator.state.my_color_index,
+            )
 
         elif isinstance(msg, TradeExecutionMsg):
             self.translator.update_resources_from_trade(
@@ -290,6 +305,11 @@ class BridgeServer:
                 msg.receiving_player,
                 msg.giving_cards,
                 msg.receiving_cards,
+            )
+            self.card_tracker.on_trade(
+                msg.giving_player, msg.receiving_player,
+                msg.giving_cards, msg.receiving_cards,
+                self.translator.state.my_color_index,
             )
 
         elif isinstance(msg, DiscardPromptMsg):
@@ -326,6 +346,12 @@ class BridgeServer:
         # Set our color and player order
         self.translator.set_my_color(msg.player_color)
         self.translator.set_player_order(msg.play_order)
+
+        # Initialize card tracker for opponents
+        self.card_tracker.reset()
+        for col_idx in msg.play_order:
+            if col_idx != msg.player_color:
+                self.card_tracker.init_player(col_idx)
 
         game_state = msg.game_state
         map_state = game_state.get("mapState", {})
@@ -742,6 +768,9 @@ class BridgeServer:
                 # Not our turn — reset flags for our next turn
                 self._dice_rolled_this_turn = False
                 self._attempted_dev_play_this_turn = False
+                self._trade_proposed_this_turn = False
+                self._pending_our_trade = False
+                self._pending_trade_proposal = None
                 # Reset road building flags on turn change
                 self.translator.state.is_road_building = False
                 self.translator.state.free_roads_available = 0
@@ -790,6 +819,14 @@ class BridgeServer:
                     owner, building_type,
                 )
 
+                # Track opponent building costs
+                my_col = self.translator.state.my_color_index
+                if owner != my_col and not self.translator.state.is_setup_phase:
+                    if building_type == 1:
+                        self.card_tracker.on_build(owner, "SETTLEMENT")
+                    elif building_type == 2:
+                        self.card_tracker.on_build(owner, "CITY")
+
         # Road updates
         edges = map_state.get("tileEdgeStates")
         if edges:
@@ -819,6 +856,11 @@ class BridgeServer:
                 self.translator.update_edge(
                     coord[0], coord[1], coord[2], owner,
                 )
+
+                # Track opponent road costs
+                my_col = self.translator.state.my_color_index
+                if owner != my_col and not self.translator.state.is_setup_phase:
+                    self.card_tracker.on_build(owner, "ROAD")
 
     def _sync_resources_from_player_states(self, player_states: Dict) -> None:
         """Sync resource hands from authoritative playerStates in type 91 diff.
@@ -856,23 +898,14 @@ class BridgeServer:
                         new_resources[resource] += 1
                 self.translator.state.my_resources = new_resources
             else:
-                # Opponent: known card IDs map to resources, unknown (id=0)
-                # are distributed evenly to preserve total count
-                new_resources = {r: 0 for r in resource_names}
-                unknown_count = 0
-                for card_id in cards:
-                    resource = COLONIST_RESOURCE_TO_CATAN.get(card_id)
-                    if resource:
-                        new_resources[resource] += 1
-                    else:
-                        unknown_count += 1
-                # Distribute unknown cards evenly across resource types
-                if unknown_count > 0:
-                    per_type = unknown_count // 5
-                    remainder = unknown_count % 5
-                    for i, r in enumerate(resource_names):
-                        new_resources[r] += per_type + (1 if i < remainder else 0)
-                self.translator.state.opponent_resources[col_idx] = new_resources
+                # Opponent: reconcile card tracker with authoritative total,
+                # then use tracked known resources + distributed unknowns
+                authoritative_total = len(cards)
+                self.card_tracker.reconcile(col_idx, authoritative_total)
+                self.translator.state.opponent_resources[col_idx] = (
+                    self.card_tracker.get_resources_for_state(col_idx)
+                )
+                self.card_tracker.log_state(col_idx)
 
     def _process_dev_card_diff(self, dev_state: Dict) -> None:
         """Process mechanicDevelopmentCardsState from type 91 diff or type 4 init.
@@ -1026,6 +1059,78 @@ class BridgeServer:
                 existing["playerResponses"] = existing_responses
                 self._active_trade_offers[trade_id] = existing
 
+                # Handle responses to OUR trade proposal
+                if self._pending_our_trade and existing.get("creator") == my_col_idx:
+                    await self._handle_our_trade_responses(trade_id, existing_responses)
+
+    async def _handle_our_trade_responses(self, trade_id: str, responses: Dict) -> None:
+        """Handle responses to a trade WE proposed.
+
+        Waits ~2s after first accept for more responses, then picks best acceptee.
+        """
+        my_col_str = str(self.translator.state.my_color_index)
+
+        acceptees = [int(pid) for pid, resp in responses.items()
+                     if pid != my_col_str and resp == TRADE_RESPONSE_ACCEPT]
+        all_responded = all(
+            resp != TRADE_RESPONSE_PENDING
+            for pid, resp in responses.items()
+            if pid != my_col_str
+        )
+
+        if acceptees and self._first_accept_time == 0.0:
+            self._first_accept_time = time.monotonic()
+            logger.info(f"First accept on our trade from {acceptees}")
+
+        # Wait 2s after first accept for more responses (unless all responded)
+        if acceptees and not all_responded:
+            if time.monotonic() - self._first_accept_time < 2.0:
+                return  # Wait for more responses
+
+        if not acceptees:
+            if all_responded:
+                logger.info("All opponents rejected our trade")
+                self._pending_our_trade = False
+                self._pending_trade_proposal = None
+            return
+
+        # Pick the best acceptee
+        proposal = self._pending_trade_proposal
+        if proposal is None:
+            self._pending_our_trade = False
+            return
+
+        game = self.translator.reconstruct_game()
+        my_color = self.translator.state.my_catan_color
+        if not game or not my_color:
+            self._pending_our_trade = False
+            self._pending_trade_proposal = None
+            return
+
+        opponent_vps = self._get_opponent_vps(game)
+        c2c = self.translator.state.colonist_to_catan_color
+
+        best = self.bot.pick_trade_acceptee(
+            game, my_color, acceptees,
+            offered_catan=proposal.get("_offered_catan", []),
+            wanted_catan=proposal.get("_wanted_catan", []),
+            delta_us=proposal.get("_delta_us", 0.0),
+            opponent_vps=opponent_vps,
+            colonist_to_catan=c2c,
+            vps_to_win=game.vps_to_win,
+        )
+
+        if best is not None:
+            logger.info(f"Executing trade {trade_id} with player {best}")
+            self._send({"action": 14, "data": {
+                "tradeId": trade_id, "playerColor": best,
+            }})
+        else:
+            logger.info("No acceptable trade partner, cancelling")
+
+        self._pending_our_trade = False
+        self._pending_trade_proposal = None
+
     # ------------------------------------------------------------------
     # Turn handlers
     # ------------------------------------------------------------------
@@ -1145,10 +1250,45 @@ class BridgeServer:
         When colonist.io confirms the action via type 91 diff, the consumer
         processes it, updates shadow state, and calls _handle_our_turn again.
         """
+        # If we have a pending trade proposal, wait for responses or timeout
+        if self._pending_our_trade:
+            elapsed = time.monotonic() - self._trade_proposal_time
+            if elapsed > 5.0:
+                logger.info("Trade proposal timed out (5s), proceeding with turn")
+                self._pending_our_trade = False
+                self._pending_trade_proposal = None
+            else:
+                return  # Still waiting for responses
+
         game = self.translator.reconstruct_game()
         my_color = self.translator.state.my_catan_color
         if not my_color or not game:
             return
+
+        # Trade proposal: try once per turn, before build decisions
+        if self._propose_trades and not self._trade_proposed_this_turn:
+            self._trade_proposed_this_turn = True
+            try:
+                opponent_vps = self._get_opponent_vps(game)
+                proposal = self.bot.propose_trade(
+                    game, my_color, opponent_vps, game.vps_to_win,
+                )
+                if proposal:
+                    self._send({"action": 11, "data": {
+                        "offered": proposal["offered"],
+                        "wanted": proposal["wanted"],
+                    }})
+                    self._pending_our_trade = True
+                    self._trade_proposal_time = time.monotonic()
+                    self._first_accept_time = 0.0
+                    self._pending_trade_proposal = proposal
+                    logger.info(
+                        f"Proposed trade: offer {proposal['offered']} "
+                        f"for {proposal['wanted']}"
+                    )
+                    return  # Wait for responses
+            except Exception as e:
+                logger.error(f"Trade proposal failed: {e}", exc_info=True)
 
         # Dev card diagnostics — always log so we can trace issues
         ts = self.translator.state
@@ -1380,6 +1520,7 @@ class BridgeServer:
         our_color = self.translator.state.my_catan_color
         creator_vps = 0
         vps_to_win = 10
+        creator_catan = None
         if game is not None:
             vps_to_win = game.vps_to_win
             creator_catan = self.translator.state.colonist_to_catan_color.get(creator)
@@ -1396,6 +1537,7 @@ class BridgeServer:
             our_color=our_color,
             creator_vps=creator_vps,
             vps_to_win=vps_to_win,
+            creator_color=creator_catan,
         )
 
         if accept:
@@ -1417,6 +1559,20 @@ class BridgeServer:
     # ------------------------------------------------------------------
 
     _RESOURCE_LETTER = {"WOOD": "w", "BRICK": "b", "SHEEP": "s", "WHEAT": "g", "ORE": "o"}
+
+    def _get_opponent_vps(self, game) -> Dict[int, int]:
+        """Get VP counts for all opponents, keyed by colonist color index."""
+        result = {}
+        my_col = self.translator.state.my_color_index
+        c2c = self.translator.state.colonist_to_catan_color
+        for col_idx, catan_color in c2c.items():
+            if col_idx == my_col:
+                continue
+            if catan_color in game.state.color_to_index:
+                p_idx = game.state.color_to_index[catan_color]
+                result[col_idx] = game.state.player_state.get(
+                    f"P{p_idx}_ACTUAL_VICTORY_POINTS", 0)
+        return result
 
     def _store_tile_data(self, tile_hex_states: Dict) -> None:
         """Store tile data by index and coord for action descriptions."""
@@ -1512,6 +1668,10 @@ class BridgeServer:
             return f"Play {card}"
         elif action == 13:
             return f"Road Building: place road at e{payload}"
+        elif action == 14:
+            if isinstance(payload, dict):
+                return f"Execute trade {payload.get('tradeId', '?')} with P{payload.get('playerColor', '?')}"
+            return "Execute trade"
         return ""
 
     async def _safe_execute(self, handler) -> None:
@@ -1576,12 +1736,14 @@ class BridgeServer:
 async def main(bot_type: str = "value", anticheat: bool = None,
                search_depth: int = 2, blend_weight: float = 1e8,
                bc_model_path: str = "robottler/models/value_net_v2.pt",
-               trade_strategy: str = "blend"):
+               trade_strategy: str = "blend",
+               propose_trades: bool = False):
     """Start the bridge server."""
     server = BridgeServer(
         bot_type=bot_type, anticheat=anticheat,
         search_depth=search_depth, blend_weight=blend_weight,
         bc_model_path=bc_model_path, trade_strategy=trade_strategy,
+        propose_trades=propose_trades,
     )
     async with websockets.serve(server.handle_connection, WS_HOST, WS_PORT):
         logger.info(f"Bridge server running on ws://{WS_HOST}:{WS_PORT} (bot={bot_type})")
@@ -1607,10 +1769,13 @@ if __name__ == "__main__":
     parser.add_argument("--trade-strategy", type=str, default="blend",
                         choices=["blend", "heuristic"],
                         help="Trade evaluation strategy (default: blend)")
+    parser.add_argument("--propose-trades", action="store_true",
+                        help="Enable bot trade proposals (default: off)")
     args = parser.parse_args()
     anticheat = False if args.no_anticheat else None
     asyncio.run(main(
         bot_type=args.bot, anticheat=anticheat,
         search_depth=args.search_depth, blend_weight=args.blend_weight,
         bc_model_path=args.bc_model, trade_strategy=args.trade_strategy,
+        propose_trades=args.propose_trades,
     ))

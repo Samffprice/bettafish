@@ -20,7 +20,7 @@ from catanatron.models.player import Color
 from catanatron.players.value import ValueFunctionPlayer
 from catanatron.players.weighted_random import WeightedRandomPlayer
 
-from bridge.config import COLONIST_RESOURCE_TO_CATAN
+from bridge.config import COLONIST_RESOURCE_TO_CATAN, CATAN_RESOURCE_TO_COLONIST
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +38,45 @@ RESOURCE_PRIORITY = {
 # Trade strategy: "blend" — value function before/after comparison
 # ---------------------------------------------------------------------------
 
+# Opponent-aware trade weights (tunable via dataset comparison)
+OPP_WEIGHT = 0.5       # How much we penalize opponent gain relative to ours
+LOOKAHEAD_WEIGHT = 0.3  # Partial weight on opponent's best immediate build
+
+
+def _opponent_new_build_types(bb, opp_idx):
+    """Check what build types the opponent can afford in a given state.
+
+    Returns a set of ActionType values for builds the opponent can make.
+    Uses direct resource checks (no movegen) for speed.
+    """
+    from robottler.bitboard.state import PS_WOOD, PS_BRICK, PS_SHEEP, PS_WHEAT, PS_ORE
+    ps = bb.player_state[opp_idx]
+    builds = set()
+    # Road: WOOD + BRICK
+    if ps[PS_WOOD] >= 1 and ps[PS_BRICK] >= 1:
+        builds.add(ActionType.BUILD_ROAD)
+    # Settlement: WOOD + BRICK + SHEEP + WHEAT
+    if ps[PS_WOOD] >= 1 and ps[PS_BRICK] >= 1 and ps[PS_SHEEP] >= 1 and ps[PS_WHEAT] >= 1:
+        builds.add(ActionType.BUILD_SETTLEMENT)
+    # City: 2 WHEAT + 3 ORE
+    if ps[PS_WHEAT] >= 2 and ps[PS_ORE] >= 3:
+        builds.add(ActionType.BUILD_CITY)
+    # Dev card: SHEEP + WHEAT + ORE
+    if ps[PS_SHEEP] >= 1 and ps[PS_WHEAT] >= 1 and ps[PS_ORE] >= 1:
+        builds.add(ActionType.BUY_DEVELOPMENT_CARD)
+    return builds
+
+
 def _evaluate_trade_blend(offered_catan, wanted_catan, game, our_color,
-                          creator_vps, vps_to_win, bb_value_fn):
-    """Evaluate trade by comparing blend value before and after.
+                          creator_vps, vps_to_win, bb_value_fn,
+                          creator_color=None):
+    """Evaluate trade by comparing blend value before and after for both sides.
 
-    Converts game to bitboard, evaluates, applies trade to resource
-    counts, evaluates again. Accepts if our value improves.
-    Also applies a match-point hard block.
+    Converts game to bitboard, evaluates both our and opponent's position
+    before/after trade. Penalizes trades that help the opponent more than us.
+    Optionally does 1-ply lookahead to check opponent build potential.
 
-    Returns float: positive = position improves, negative = worsens.
+    Returns float: positive = good trade, negative = bad trade.
     """
     from robottler.bitboard.convert import game_to_bitboard
     from robottler.bitboard.state import PS_WOOD
@@ -68,17 +98,72 @@ def _evaluate_trade_blend(offered_catan, wanted_catan, game, our_color,
         if bb.player_state[p_idx][ri] < needed:
             return -100.0
 
-    value_before = bb_value_fn(bb, our_color)
+    # Resolve opponent index (if creator_color provided and they can afford it)
+    opp_idx = None
+    if creator_color is not None and creator_color in bb.color_to_index:
+        candidate_idx = bb.color_to_index[creator_color]
+        # Verify opponent can afford what they're offering (protects against
+        # imperfect state reconstruction / card-counting gaps)
+        opp_can_afford = True
+        for resource, needed in Counter(offered_catan).items():
+            ri = PS_WOOD + RESOURCE_INDEX[resource]
+            if bb.player_state[candidate_idx][ri] < needed:
+                opp_can_afford = False
+                break
+        if opp_can_afford:
+            opp_idx = candidate_idx
 
-    # Apply trade: modify resource counts in-place
-    for r in wanted_catan:
-        bb.player_state[p_idx][PS_WOOD + RESOURCE_INDEX[r]] -= 1
-    for r in offered_catan:
-        bb.player_state[p_idx][PS_WOOD + RESOURCE_INDEX[r]] += 1
+    # Snapshot opponent build capabilities before trade (for lookahead)
+    builds_before = _opponent_new_build_types(bb, opp_idx) if opp_idx is not None else set()
 
-    value_after = bb_value_fn(bb, our_color)
+    # Evaluate BOTH sides before trade
+    value_us_before = bb_value_fn(bb, our_color)
+    value_opp_before = bb_value_fn(bb, creator_color) if opp_idx is not None else 0.0
 
-    return value_after - value_before
+    # Apply trade to BOTH players' resources
+    for r in wanted_catan:  # what we give = what they get
+        ri = RESOURCE_INDEX[r]
+        bb.player_state[p_idx][PS_WOOD + ri] -= 1
+        if opp_idx is not None:
+            bb.player_state[opp_idx][PS_WOOD + ri] += 1
+    for r in offered_catan:  # what they give = what we get
+        ri = RESOURCE_INDEX[r]
+        bb.player_state[p_idx][PS_WOOD + ri] += 1
+        if opp_idx is not None:
+            bb.player_state[opp_idx][PS_WOOD + ri] -= 1
+
+    # Evaluate BOTH sides after trade
+    value_us_after = bb_value_fn(bb, our_color)
+    value_opp_after = bb_value_fn(bb, creator_color) if opp_idx is not None else 0.0
+
+    delta_us = value_us_after - value_us_before
+    delta_opp = value_opp_after - value_opp_before
+
+    # 1-ply lookahead: check if trade enables new build types for opponent
+    lookahead_penalty = 0.0
+    if opp_idx is not None and delta_us > 0:
+        builds_after = _opponent_new_build_types(bb, opp_idx)
+        new_builds = builds_after - builds_before
+        if new_builds:
+            # Penalty scales with build importance
+            BUILD_THREAT = {
+                ActionType.BUILD_CITY: 1.0,
+                ActionType.BUILD_SETTLEMENT: 0.8,
+                ActionType.BUY_DEVELOPMENT_CARD: 0.5,
+                ActionType.BUILD_ROAD: 0.2,
+            }
+            threat = max(BUILD_THREAT.get(b, 0) for b in new_builds)
+            # Scale penalty relative to trade benefit (scale-invariant)
+            lookahead_penalty = LOOKAHEAD_WEIGHT * threat * abs(delta_us)
+
+    score = delta_us - OPP_WEIGHT * delta_opp - lookahead_penalty
+
+    logger.debug(
+        f"Trade blend: delta_us={delta_us:.4f} delta_opp={delta_opp:.4f} "
+        f"score={score:.4f}"
+    )
+
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +422,7 @@ class BotInterface:
         our_color=None,
         creator_vps: int = 0,
         vps_to_win: int = 10,
+        creator_color=None,
     ) -> bool:
         """Decide whether to accept or reject a trade offer.
 
@@ -358,6 +444,7 @@ class BotInterface:
                     score = _evaluate_trade_blend(
                         offered_catan, wanted_catan, game, our_color,
                         creator_vps, vps_to_win, bb_vf,
+                        creator_color=creator_color,
                     )
                 else:
                     score = _evaluate_trade_heuristic(
@@ -391,3 +478,198 @@ class BotInterface:
 
         logger.info(f"Rejecting trade {trade_id}: unfavorable (fallback)")
         return False
+
+    # ------------------------------------------------------------------
+    # Trade proposal (outbound)
+    # ------------------------------------------------------------------
+
+    # Minimum value improvement to propose a trade (filters out marginal trades)
+    _MIN_PROPOSAL_DELTA = 0.0
+
+    def propose_trade(
+        self,
+        game,
+        our_color: Color,
+        opponent_vps: Dict[int, int],
+        vps_to_win: int = 10,
+    ) -> Optional[Dict]:
+        """Generate the best 1:1 or 2:1 trade proposal, or None.
+
+        Args:
+            game: Reconstructed Catanatron game.
+            our_color: Our Catanatron color.
+            opponent_vps: {colonist_color_idx: vp_count} for all opponents.
+            vps_to_win: VP target.
+
+        Returns:
+            {"offered": [colonist_resource_ids], "wanted": [colonist_resource_ids]}
+            or None if no good trade found.
+        """
+        from robottler.bitboard.convert import game_to_bitboard
+        from robottler.bitboard.state import PS_WOOD
+        from robottler.bitboard.masks import RESOURCE_INDEX
+
+        # Don't propose if we're about to win (nobody will trade with us)
+        our_idx = game.state.color_to_index[our_color]
+        our_vps = game.state.player_state.get(
+            f"P{our_idx}_ACTUAL_VICTORY_POINTS", 0)
+        if our_vps >= vps_to_win - 1:
+            return None
+
+        bb_vf = self._get_bb_value_fn()
+        bb = game_to_bitboard(game)
+        p_idx = bb.color_to_index[our_color]
+
+        # Our current hand
+        hand = {}
+        for res in RESOURCES:
+            hand[res] = int(bb.player_state[p_idx][PS_WOOD + RESOURCE_INDEX[res]])
+
+        value_before = bb_vf(bb, our_color)
+
+        best_score = self._MIN_PROPOSAL_DELTA
+        best_proposal = None
+
+        # Enumerate 1:1 and 2:1 trades
+        for give_res in RESOURCES:
+            give_ri = RESOURCE_INDEX[give_res]
+
+            for give_count in (1, 2):
+                if hand[give_res] < give_count:
+                    continue
+
+                for want_res in RESOURCES:
+                    if want_res == give_res:
+                        continue
+
+                    want_ri = RESOURCE_INDEX[want_res]
+
+                    # Apply trade to our resources
+                    bb.player_state[p_idx][PS_WOOD + give_ri] -= give_count
+                    bb.player_state[p_idx][PS_WOOD + want_ri] += 1
+
+                    delta = bb_vf(bb, our_color) - value_before
+
+                    # Revert
+                    bb.player_state[p_idx][PS_WOOD + give_ri] += give_count
+                    bb.player_state[p_idx][PS_WOOD + want_ri] -= 1
+
+                    if delta > best_score:
+                        best_score = delta
+                        best_proposal = {
+                            "offered": [CATAN_RESOURCE_TO_COLONIST[give_res]] * give_count,
+                            "wanted": [CATAN_RESOURCE_TO_COLONIST[want_res]],
+                            # Keep catan names for logging/acceptee eval
+                            "_offered_catan": [give_res] * give_count,
+                            "_wanted_catan": [want_res],
+                            "_delta_us": delta,
+                        }
+
+        if best_proposal:
+            logger.info(
+                f"Trade proposal: offer {best_proposal['_offered_catan']} "
+                f"for {best_proposal['_wanted_catan']} "
+                f"(delta={best_proposal['_delta_us']:.2f})"
+            )
+        return best_proposal
+
+    def pick_trade_acceptee(
+        self,
+        game,
+        our_color: Color,
+        acceptees: List[int],
+        offered_catan: List[str],
+        wanted_catan: List[str],
+        delta_us: float,
+        opponent_vps: Dict[int, int],
+        colonist_to_catan: Dict[int, Color],
+        vps_to_win: int = 10,
+    ) -> Optional[int]:
+        """Pick the best acceptee from those who accepted our trade.
+
+        Args:
+            acceptees: List of colonist color indices who accepted.
+            offered_catan: What we offered (Catanatron resource names).
+            wanted_catan: What we wanted (Catanatron resource names).
+            delta_us: Our value improvement from this trade.
+            opponent_vps: {colonist_color_idx: vp_count}.
+            colonist_to_catan: Color mapping.
+            vps_to_win: VP target.
+
+        Returns:
+            Colonist color index of best acceptee, or None to cancel.
+        """
+        from robottler.bitboard.convert import game_to_bitboard
+        from robottler.bitboard.state import PS_WOOD
+        from robottler.bitboard.masks import RESOURCE_INDEX
+
+        bb_vf = self._get_bb_value_fn()
+        bb = game_to_bitboard(game)
+
+        scored = []
+        for col_idx in acceptees:
+            opp_vp = opponent_vps.get(col_idx, 0)
+
+            # Hard filter: never trade with someone at match point
+            if opp_vp >= vps_to_win - 1:
+                logger.info(f"Rejecting acceptee {col_idx}: at match point ({opp_vp} VP)")
+                continue
+
+            opp_color = colonist_to_catan.get(col_idx)
+            if opp_color is None or opp_color not in bb.color_to_index:
+                continue
+            opp_idx = bb.color_to_index[opp_color]
+
+            # Check opponent can afford what we want (= what they give us)
+            can_afford = True
+            for res, needed in Counter(wanted_catan).items():
+                if bb.player_state[opp_idx][PS_WOOD + RESOURCE_INDEX[res]] < needed:
+                    can_afford = False
+                    break
+            if not can_afford:
+                continue
+
+            # Evaluate opponent's gain from this trade
+            value_opp_before = bb_vf(bb, opp_color)
+
+            # Apply trade to opponent's resources (temporarily)
+            for r in wanted_catan:  # they give us this (they lose)
+                bb.player_state[opp_idx][PS_WOOD + RESOURCE_INDEX[r]] -= 1
+            for r in offered_catan:  # they get this (they gain)
+                bb.player_state[opp_idx][PS_WOOD + RESOURCE_INDEX[r]] += 1
+
+            value_opp_after = bb_vf(bb, opp_color)
+
+            # Revert
+            for r in wanted_catan:
+                bb.player_state[opp_idx][PS_WOOD + RESOURCE_INDEX[r]] += 1
+            for r in offered_catan:
+                bb.player_state[opp_idx][PS_WOOD + RESOURCE_INDEX[r]] -= 1
+
+            delta_opp = value_opp_after - value_opp_before
+
+            # VP-weighted: leaders' gains count more
+            vp_ratio = opp_vp / vps_to_win if vps_to_win > 0 else 0
+            adjusted_opp = delta_opp * (1.0 + vp_ratio)
+
+            # Reject if they benefit way more than us
+            if delta_us > 0 and adjusted_opp > 2.0 * delta_us:
+                logger.info(
+                    f"Rejecting acceptee {col_idx}: opp benefit too high "
+                    f"(adj={adjusted_opp:.2f} vs us={delta_us:.2f})")
+                continue
+
+            scored.append((col_idx, adjusted_opp))
+            logger.debug(
+                f"Acceptee {col_idx}: delta_opp={delta_opp:.2f} "
+                f"vp_ratio={vp_ratio:.2f} adjusted={adjusted_opp:.2f}")
+
+        if not scored:
+            logger.info("No acceptable trade partners, cancelling trade")
+            return None
+
+        # Pick the opponent who benefits least (relative to us)
+        scored.sort(key=lambda x: x[1])
+        winner = scored[0]
+        logger.info(f"Picked acceptee {winner[0]} (adj_score={winner[1]:.2f})")
+        return winner[0]

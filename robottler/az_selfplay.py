@@ -361,7 +361,7 @@ def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
         num_simulations=num_simulations, c_puct=c_puct,
         temperature=1.0,
         dirichlet_alpha=0.3, dirichlet_weight=0.25,
-        leaf_value_fn=leaf_value_fn,
+        leaf_value_fn=leaf_value_fn, leaf_use_policy=False,
     )
     p2 = BBMCTSPlayer(
         color=Color.BLUE, az_net=az_net,
@@ -370,7 +370,7 @@ def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
         num_simulations=num_simulations, c_puct=c_puct,
         temperature=1.0,
         dirichlet_alpha=0.3, dirichlet_weight=0.25,
-        leaf_value_fn=leaf_value_fn,
+        leaf_value_fn=leaf_value_fn, leaf_use_policy=False,
     )
 
     game = Game(players=[p1, p2], vps_to_win=vps_to_win)
@@ -932,8 +932,10 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
         catan_map = build_map(BASE_MAP_TEMPLATE)
         fi = FeatureIndexer(feature_index_map, catan_map)
 
-        for i in tqdm(range(start_game, num_games), desc="Self-play",
-                      initial=start_game, total=num_games):
+        _sp_games_done = 0
+        pbar = tqdm(range(start_game, num_games), desc="Self-play",
+                    initial=start_game, total=num_games)
+        for i in pbar:
             records, winner, turns = generate_one_game_v2(
                 net, fi, feat_means, feat_stds,
                 num_simulations=num_simulations,
@@ -944,6 +946,8 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
             )
             all_records.extend(records)
             total_turns += turns
+            _sp_games_done += 1
+            pbar.set_postfix(avg_turns=f"{total_turns/_sp_games_done:.0f}", refresh=True)
             winners[winner] = winners.get(winner, 0) + 1
 
             if output_dir is not None:
@@ -966,33 +970,42 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
             initargs=(checkpoint_path, num_simulations, c_puct,
                       temperature_threshold, vps_to_win, blend_bootstrap_path),
         ) as pool:
-            game_results = list(tqdm(
+            game_results = []
+            _sp_total_turns = 0
+            _sp_games_done = 0
+            pbar = tqdm(
                 pool.imap_unordered(_az_worker_play_one, range(remaining)),
                 total=remaining, desc="Self-play", initial=start_game,
-            ))
+            )
+            for result in pbar:
+                game_results.append(result)
+                _sp_games_done += 1
+                _sp_total_turns += result[4]  # turns
+                avg_t = _sp_total_turns / _sp_games_done
+                pbar.set_postfix(avg_turns=f"{avg_t:.0f}", refresh=True)
 
-        for features_list, policies_list, values_list, winner_str, turns in game_results:
-            for feat, pol, val in zip(features_list, policies_list, values_list):
-                all_records.append(SelfPlayRecord(feat, pol, val))
-            total_turns += turns
-            if winner_str in ('None', 'null'):
-                winners[None] = winners.get(None, 0) + 1
-            else:
-                name = winner_str.replace('Color.', '') if winner_str.startswith('Color.') else winner_str
-                winners[Color[name]] = winners.get(Color[name], 0) + 1
+                # Incremental save — process this result immediately
+                features_list, policies_list, values_list, winner_str, turns = result
+                for feat, pol, val in zip(features_list, policies_list, values_list):
+                    all_records.append(SelfPlayRecord(feat, pol, val))
+                total_turns += turns
+                if winner_str in ('None', 'null'):
+                    winners[None] = winners.get(None, 0) + 1
+                else:
+                    name = winner_str.replace('Color.', '') if winner_str.startswith('Color.') else winner_str
+                    winners[Color[name]] = winners.get(Color[name], 0) + 1
 
-        # Save all at once after parallel generation
-        if output_dir is not None:
-            save_records(all_records, output_dir, quiet=True)
-            with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
-                json.dump({
-                    'games_completed': num_games,
-                    'total_games': num_games,
-                    'total_turns': total_turns,
-                    'total_records': len(all_records),
-                    'winners': {str(k): v for k, v in winners.items()},
-                    'checkpoint': checkpoint_path,
-                }, f)
+                if output_dir is not None:
+                    save_records(all_records, output_dir, quiet=True)
+                    with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
+                        json.dump({
+                            'games_completed': start_game + _sp_games_done,
+                            'total_games': num_games,
+                            'total_turns': total_turns,
+                            'total_records': len(all_records),
+                            'winners': {str(k): v for k, v in winners.items()},
+                            'checkpoint': checkpoint_path,
+                        }, f)
 
     stats = {
         'num_games': num_games,
@@ -1120,7 +1133,8 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                   human_data_dir=None, human_mix_ratio=0.5,
                   freeze_value=False, differential_lr=False,
                   label_smoothing=0.0, scheduler='cosine',
-                  body_dims=None, dropout=0.0):
+                  body_dims=None, dropout=0.0,
+                  resume_training=None):
     """Train AlphaZero network on self-play data, optionally mixed with human data.
 
     Args:
@@ -1151,6 +1165,9 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             is only used for feature normalization metadata.
         dropout: Dropout rate in body layers (default 0.0). Only used
             when body_dims is specified.
+        resume_training: Path to a training checkpoint to resume from.
+            Restores model weights, optimizer state, LR scheduler state,
+            best val loss, and epoch counter. Resumes from last completed epoch.
 
     Returns:
         training stats dict
@@ -1200,9 +1217,12 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
         all_policies.append(p)
         all_values.append(v)
 
-    sp_features = np.concatenate(all_features)
-    sp_policies = np.concatenate(all_policies)
-    sp_values = np.concatenate(all_values)
+    sp_features = np.concatenate(all_features).astype(np.float32)
+    del all_features
+    sp_policies = np.concatenate(all_policies).astype(np.float32)
+    del all_policies
+    sp_values = np.concatenate(all_values).astype(np.float32)
+    del all_values
     n_sp = len(sp_values)
 
     print(f"Self-play data: {n_sp} samples from {len(data_dirs)} dir(s)")
@@ -1210,40 +1230,52 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
 
     # Optionally mix in human data
     if human_data_dir is not None and human_mix_ratio > 0:
-        # Match human sample count to achieve desired ratio
         n_human = int(n_sp * human_mix_ratio / (1 - human_mix_ratio))
         h_feat, h_pol, h_val = _load_human_data(
             human_data_dir, list(feat_names), max_samples=n_human)
+        sp_features = np.concatenate([sp_features, h_feat.astype(np.float32)])
+        del h_feat
+        sp_policies = np.concatenate([sp_policies, h_pol.astype(np.float32)])
+        del h_pol
+        sp_values = np.concatenate([sp_values, h_val.astype(np.float32)])
+        del h_val
+        print(f"Mixed training: {n_sp} self-play + {len(sp_values)-n_sp} human "
+              f"= {len(sp_values)} total")
 
-        features = np.concatenate([sp_features, h_feat])
-        policies = np.concatenate([sp_policies, h_pol])
-        values = np.concatenate([sp_values, h_val])
-        print(f"Mixed training: {n_sp} self-play + {len(h_val)} human "
-              f"= {len(values)} total ({len(h_val)/len(values)*100:.0f}% human)")
-    else:
-        features = sp_features
-        policies = sp_policies
-        values = sp_values
+    # Normalize features in-place
+    f_means = np.asarray(feat_means, dtype=np.float32)
+    f_stds = np.asarray(feat_stds, dtype=np.float32)
+    sp_features -= f_means
+    sp_features /= f_stds
 
-    # Preload entire dataset as tensors on device (skip per-batch transfers)
-    dataset = SelfPlayDataset(features, policies, values, feat_means, feat_stds)
-
-    # Train/val split (90/10)
-    n_total = len(dataset)
+    # Train/val split — convert one array at a time to minimize peak memory
+    import gc
+    n_total = len(sp_values)
     n_val = max(1, int(n_total * 0.1))
     n_train = n_total - n_val
-    perm_split = torch.randperm(n_total)
-    train_idx = perm_split[:n_train]
-    val_idx = perm_split[n_train:]
+    perm = torch.randperm(n_total)
+    train_perm = perm[:n_train]
+    val_perm = perm[n_train:]
+    del perm
 
-    train_feat = dataset.features[train_idx].to(device)
-    train_pol = dataset.policies[train_idx].to(device)
-    train_val = dataset.values[train_idx].to(device)
-    val_feat = dataset.features[val_idx].to(device)
-    val_pol = dataset.policies[val_idx].to(device)
-    val_val = dataset.values[val_idx].to(device)
+    # Features: numpy → torch (zero-copy) → index → to device → free numpy
+    _t = torch.from_numpy(sp_features)
+    train_feat = _t[train_perm].to(device)
+    val_feat = _t[val_perm].to(device)
+    del _t, sp_features; gc.collect()
+
+    _t = torch.from_numpy(sp_policies)
+    train_pol = _t[train_perm].to(device)
+    val_pol = _t[val_perm].to(device)
+    del _t, sp_policies; gc.collect()
+
+    _t = torch.from_numpy(sp_values)
+    train_val = _t[train_perm].to(device)
+    val_val = _t[val_perm].to(device)
+    del _t, sp_values, train_perm, val_perm; gc.collect()
+
     n_samples = n_train
-    print(f"  Preloaded {n_train} train + {n_val} val samples to {device}")
+    print(f"  {n_train} train + {n_val} val samples on {device}")
 
     # Freeze value path — what gets frozen depends on shared vs split body
     if freeze_value:
@@ -1293,6 +1325,35 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
     if label_smoothing > 0:
         print(f"  Label smoothing: {label_smoothing}")
 
+    # Resume from training checkpoint if provided
+    start_epoch = 0
+    best_val_loss = float('inf')
+    best_state_dict = None
+    patience_counter = 0
+    history = []
+
+    if resume_training is not None and os.path.exists(resume_training):
+        print(f"  Resuming training from {resume_training}")
+        resume_ckpt = torch.load(resume_training, map_location='cpu', weights_only=False)
+        net.load_state_dict(resume_ckpt['model_state_dict'])
+        net.to(device)
+        if 'optimizer_state_dict' in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
+        if 'lr_scheduler_state_dict' in resume_ckpt and lr_scheduler is not None:
+            lr_scheduler.load_state_dict(resume_ckpt['lr_scheduler_state_dict'])
+        start_epoch = resume_ckpt.get('epoch', 0) + 1
+        best_val_loss = resume_ckpt.get('best_val_loss', float('inf'))
+        if 'best_state_dict' in resume_ckpt:
+            best_state_dict = resume_ckpt['best_state_dict']
+        patience_counter = resume_ckpt.get('patience_counter', 0)
+        history = resume_ckpt.get('training_history', [])
+        print(f"  Resuming from epoch {start_epoch}/{epochs} "
+              f"(best_val_loss={best_val_loss:.4f}, patience={patience_counter}/20)")
+        del resume_ckpt
+
+    # Training checkpoint path (for resume support)
+    train_ckpt_path = output_path.replace('.pt', '_training.pt')
+
     def _compute_loss(feat_b, pol_b, val_b):
         """Compute combined loss on a batch."""
         v_pred, logits = net(feat_b)
@@ -1311,14 +1372,9 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             p_loss = torch.tensor(0.0, device=feat_b.device)
         return value_weight * v_loss + p_loss, v_loss, p_loss
 
-    # Early stopping state
-    best_val_loss = float('inf')
-    best_state_dict = None
     patience = 20
-    patience_counter = 0
 
-    history = []
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         net.train()
         total_loss = 0.0
         total_v_loss = 0.0
@@ -1377,6 +1433,26 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                       f"(val loss {val_loss_val:.4f} vs best {best_val_loss:.4f})")
                 break
 
+        # Save training checkpoint every 5 epochs (for resume on Ctrl+C)
+        if (epoch + 1) % 5 == 0:
+            _save_train_ckpt = {
+                'model_state_dict': net.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch,
+                'best_val_loss': best_val_loss,
+                'best_state_dict': best_state_dict,
+                'patience_counter': patience_counter,
+                'training_history': history,
+            }
+            if lr_scheduler is not None:
+                _save_train_ckpt['lr_scheduler_state_dict'] = lr_scheduler.state_dict()
+            torch.save(_save_train_ckpt, train_ckpt_path)
+            del _save_train_ckpt
+
+    # Clean up training checkpoint
+    if os.path.exists(train_ckpt_path):
+        os.remove(train_ckpt_path)
+
     # Restore best model
     if best_state_dict is not None:
         net.load_state_dict(best_state_dict)
@@ -1393,18 +1469,19 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             param.requires_grad = True
 
     net.to('cpu').eval()
+    n_total_samples = n_train + n_val
     save_checkpoint(
         net, optimizer, iteration,
         feat_names, feat_means, feat_stds,
         output_path,
-        extra={'training_history': history, 'num_samples': len(values),
+        extra={'training_history': history, 'num_samples': n_total_samples,
                'freeze_value': freeze_value, 'differential_lr': differential_lr,
-               'human_samples': len(values) - n_sp if human_data_dir else 0,
+               'human_samples': n_total_samples - n_sp if human_data_dir else 0,
                'best_val_loss': best_val_loss},
     )
     print(f"Saved trained checkpoint to {output_path} (iteration {iteration})")
 
-    return {'history': history, 'iteration': iteration, 'num_samples': len(values)}
+    return {'history': history, 'iteration': iteration, 'num_samples': n_total_samples}
 
 
 # ---------------------------------------------------------------------------
@@ -1827,6 +1904,9 @@ def main():
     train_parser.add_argument('--dropout', type=float, default=0.0,
                               help='Dropout rate in body layers (default 0.0). '
                                    'Only used with --body-dims.')
+    train_parser.add_argument('--resume-training', default=None, metavar='PATH',
+                              help='Resume from a training checkpoint (_training.pt). '
+                                   'Restores model, optimizer, scheduler, and epoch.')
 
     # Expert iteration data generation
     expert_parser = subparsers.add_parser('expert',
@@ -1946,6 +2026,7 @@ def main():
             label_smoothing=args.label_smoothing,
             scheduler=args.scheduler,
             body_dims=body_dims, dropout=args.dropout,
+            resume_training=args.resume_training,
         )
 
     elif args.command == 'evaluate':

@@ -230,12 +230,30 @@ def _city_possibilities(state, pidx, color):
 def _robber_possibilities(state, pidx, color):
     """Generate robber placement + steal target actions."""
     actions = []
+    friendly = state.friendly_robber
+
     for tid in range(NUM_TILES):
         if tid == state.robber_tile:
             continue  # must move robber
 
         coord = state.tile_id_to_coord[tid]
         tile_mask = state.catan_map.land_tiles[coord].nodes.values()
+
+        # Friendly robber: skip tiles where ALL enemy buildings belong to
+        # players with < 3 visible VP
+        if friendly:
+            enemy_owners = set()
+            for node_id in tile_mask:
+                if node_id >= NUM_NODES:
+                    continue
+                owner, _ = state.building_owner(node_id)
+                if owner is not None and owner != pidx:
+                    enemy_owners.add(owner)
+            if enemy_owners and all(
+                int(state.player_state[opp, PS_VP]) < 3
+                for opp in enemy_owners
+            ):
+                continue
 
         # Find stealable players at this tile
         stealable = set()

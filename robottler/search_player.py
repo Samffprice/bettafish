@@ -738,6 +738,22 @@ def _bb_heuristic(bb_state, p0_color, node_prod=None):
     )
 
 
+def make_bb_heuristic_value_fn():
+    """Create a pure heuristic value function for BitboardState (no neural)."""
+    from robottler.bitboard.features import FeatureIndexer
+    fi = None
+
+    def value_fn(bb_state, p0_color):
+        nonlocal fi
+        if fi is None:
+            fi = FeatureIndexer({}, bb_state.catan_map)
+        elif fi._catan_map is not bb_state.catan_map:
+            fi.update_map(bb_state.catan_map)
+        return _bb_heuristic(bb_state, p0_color, fi.node_prod)
+
+    return value_fn
+
+
 def make_bb_blended_value_fn(bc_path, blend_weight=1e10):
     """Create a blended value function for BitboardState: heuristic + weight * neural.
 
@@ -777,6 +793,51 @@ def make_bb_blended_value_fn(bc_path, blend_weight=1e10):
             n = torch.sigmoid(model(x)).item()
 
         # Heuristic eval (shares node_prod from FeatureIndexer)
+        h = _bb_heuristic(bb_state, p0_color, fi.node_prod)
+
+        return h + blend_weight * n
+
+    return value_fn
+
+
+def make_bb_az_blended_value_fn(az_path, blend_weight=1e10):
+    """Create a blended value function using an AlphaZero checkpoint's value head.
+
+    Like make_bb_blended_value_fn but loads CatanAlphaZeroNet instead of CatanValueNet.
+    The AZ value head outputs tanh [-1, +1], rescaled to [0, 1] for blend compatibility.
+    """
+    from robottler.bitboard.features import FeatureIndexer, bb_fill_feature_vector
+    from robottler.alphazero_net import load_checkpoint
+
+    net, ckpt = load_checkpoint(az_path)
+    net.eval()
+    feature_names = ckpt["feature_names"]
+    n_features = len(feature_names)
+    feature_index_map = {name: idx for idx, name in enumerate(feature_names)}
+    means_np = ckpt["feature_means"].astype(np.float32)
+    stds_np = ckpt["feature_stds"].astype(np.float32)
+
+    input_buf = np.zeros(n_features, dtype=np.float32)
+    fi = None
+
+    def value_fn(bb_state, p0_color):
+        nonlocal fi
+        if fi is None:
+            fi = FeatureIndexer(feature_index_map, bb_state.catan_map)
+        else:
+            fi.update_map(bb_state.catan_map)
+
+        # Neural eval (AZ value head: tanh [-1, +1] -> rescale to [0, 1])
+        input_buf[:] = 0.0
+        bb_fill_feature_vector(bb_state, p0_color, input_buf, fi)
+        np.subtract(input_buf, means_np, out=input_buf)
+        np.divide(input_buf, stds_np, out=input_buf)
+        x = torch.from_numpy(input_buf).unsqueeze(0)
+        with torch.inference_mode():
+            v, _ = net.forward(x)
+            n = (v.item() + 1.0) / 2.0  # tanh [-1,+1] -> [0,1]
+
+        # Heuristic eval
         h = _bb_heuristic(bb_state, p0_color, fi.node_prod)
 
         return h + blend_weight * n

@@ -234,6 +234,12 @@ function handleBotMessage(rawData) {
             sendGameAction(colonistioActions.BUILD_ROAD_SETUP, parsedData.data)
             sendGameAction(colonistioActions.CONFIRM_BUILD_DEV, parsedData.data)
             break
+        case 14: // Execute our trade with a specific acceptee
+            sendGameAction(colonistioActions.EXECUTE_TRADE, {
+                tradeId: parsedData.data.tradeId,
+                playerColor: parsedData.data.playerColor
+            })
+            break
         default:
             console.warn('[AICatan] Unknown action code:', parsedData.action)
     }
