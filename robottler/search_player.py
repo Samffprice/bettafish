@@ -700,7 +700,7 @@ def _bb_heuristic(bb_state, p0_color, node_prod=None):
     hand_synergy = (2 - dist_city - dist_settle) / 2
 
     num_in_hand = int(np.sum(ps[PS_RESOURCE_START:PS_RESOURCE_END]))
-    discard_penalty = params["discard_penalty"] if num_in_hand > 7 else 0
+    discard_penalty = params["discard_penalty"] * max(0, num_in_hand - 7)
 
     # Owned tiles count
     owned_nodes = list(bitscan(bb_state.settlement_bb[p0_idx] | bb_state.city_bb[p0_idx]))
@@ -742,7 +742,6 @@ def make_bb_blended_value_fn(bc_path, blend_weight=1e10):
     """Create a blended value function for BitboardState: heuristic + weight * neural.
 
     Shares FeatureIndexer and node_prod between neural and heuristic evaluation.
-    Uses ONNX Runtime when available (~3x faster than PyTorch).
     """
     from robottler.bitboard.features import FeatureIndexer, bb_fill_feature_vector
 
@@ -846,7 +845,8 @@ class BitboardSearchPlayer(NeuralSearchPlayer):
 
             bb_state = game_to_bitboard(game)
             deadline = time.time() + 240
-            result = self.bb_alphabeta(bb_state, self.depth, float("-inf"), float("inf"), deadline)
+            result = self.bb_alphabeta(bb_state, self.depth, float("-inf"), float("inf"), deadline,
+                                       vps_to_win=game.vps_to_win)
 
             if self._tt is not None:
                 self._tt_stats = {
@@ -863,11 +863,11 @@ class BitboardSearchPlayer(NeuralSearchPlayer):
         finally:
             self.depth = original_depth
 
-    def bb_alphabeta(self, bb_state, depth, alpha, beta, deadline):
+    def bb_alphabeta(self, bb_state, depth, alpha, beta, deadline, vps_to_win=10):
         """AlphaBeta search on BitboardState."""
         from robottler.bitboard.movegen import bb_generate_actions
 
-        if depth == 0 or bb_state.winning_player() >= 0 or time.time() >= deadline:
+        if depth == 0 or bb_state.winning_player(vps_to_win) >= 0 or time.time() >= deadline:
             return None, self._bb_eval_fn(bb_state, self.color)
 
         tt = self._tt
@@ -898,7 +898,7 @@ class BitboardSearchPlayer(NeuralSearchPlayer):
                 obs_max = float("-inf")
 
                 for outcome, proba in outcomes:
-                    result = self.bb_alphabeta(outcome, depth - 1, alpha, beta, deadline)
+                    result = self.bb_alphabeta(outcome, depth - 1, alpha, beta, deadline, vps_to_win)
                     v = result[1]
                     expected_value += proba * v
                     consumed_p += proba
@@ -942,7 +942,7 @@ class BitboardSearchPlayer(NeuralSearchPlayer):
                 obs_min = float("inf")
 
                 for outcome, proba in outcomes:
-                    result = self.bb_alphabeta(outcome, depth - 1, alpha, beta, deadline)
+                    result = self.bb_alphabeta(outcome, depth - 1, alpha, beta, deadline, vps_to_win)
                     v = result[1]
                     expected_value += proba * v
                     consumed_p += proba

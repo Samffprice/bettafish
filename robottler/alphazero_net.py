@@ -1,15 +1,16 @@
 """Dual-head AlphaZero network for Catan.
 
-Architecture:
-    Shared body:  176 → 256 → 128 (reuses value_net_v2 layers)
-    Value head:   128 → 64 → 1 (tanh, outputs [-1, +1])
-    Policy head:  128 → 64 → 290 (logits, masked softmax)
+Architecture (configurable):
+    Body:         input_dim → body_dims[0] → body_dims[1] → ... (shared or split)
+    Value head:   body_out → body_out//2 → 1 (tanh, outputs [-1, +1])
+    Policy head:  body_out → body_out//2 → 290 (logits, masked softmax)
 
-The value head uses tanh instead of sigmoid because:
-- Centers on 0 for even positions, pushes to ±1 for decisive ones
-- Double the dynamic range of sigmoid [0,1]
-- Natural midpoint for MCTS UCB formula
-- Avoids the normalization compression problem that killed MCTS with sigmoid
+Default (v1): body_dims=(256, 128), dropout=0, shared_body=True  ~96K params
+Bigger (v2):  body_dims=(512, 256), dropout=0.1, shared_body=True ~325K params
+
+When shared_body=False, separate value_body and policy_body prevent policy
+training from corrupting the warm-started value function (at the cost of
+losing shared representation benefits).
 """
 
 import torch
@@ -24,34 +25,51 @@ from catanatron.models.enums import ActionType
 
 
 class CatanAlphaZeroNet(nn.Module):
-    """Dual-head network: shared body → value head + policy head."""
+    """Dual-head network: shared or split body -> value/policy heads."""
 
-    def __init__(self, input_dim: int = 176, num_actions: int = ACTION_SPACE_SIZE):
+    def __init__(self, input_dim: int = 176, num_actions: int = ACTION_SPACE_SIZE,
+                 body_dims: tuple = (256, 128), dropout: float = 0.0,
+                 shared_body: bool = True):
         super().__init__()
         self.input_dim = input_dim
         self.num_actions = num_actions
+        self.body_dims = tuple(body_dims)
+        self.dropout = dropout
+        self.shared_body = shared_body
 
-        # Shared body (matches value_net_v2 first two layers, minus dropout)
-        self.body = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-        )
+        def _make_body():
+            layers = []
+            prev = input_dim
+            for dim in body_dims:
+                layers.append(nn.Linear(prev, dim))
+                layers.append(nn.ReLU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+                prev = dim
+            return nn.Sequential(*layers)
 
-        # Value head: 128 → 64 → 1, tanh output
+        if shared_body:
+            self.body = _make_body()
+        else:
+            self.value_body = _make_body()
+            self.policy_body = _make_body()
+
+        body_out = body_dims[-1]
+        head_hidden = max(64, body_out // 2)
+
+        # Value head: body_out -> head_hidden -> 1, tanh output
         self.value_head = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(body_out, head_hidden),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(head_hidden, 1),
             nn.Tanh(),
         )
 
-        # Policy head: 128 → 64 → num_actions (raw logits)
+        # Policy head: body_out -> head_hidden -> num_actions (raw logits)
         self.policy_head = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(body_out, head_hidden),
             nn.ReLU(),
-            nn.Linear(64, num_actions),
+            nn.Linear(head_hidden, num_actions),
         )
 
     def forward(self, x, action_mask=None):
@@ -66,9 +84,13 @@ class CatanAlphaZeroNet(nn.Module):
             value: (batch, 1) in [-1, +1]
             policy_logits: (batch, num_actions) masked logits (illegal = -inf)
         """
-        shared = self.body(x)
-        value = self.value_head(shared)
-        logits = self.policy_head(shared)
+        if self.shared_body:
+            h = self.body(x)
+            value = self.value_head(h)
+            logits = self.policy_head(h)
+        else:
+            value = self.value_head(self.value_body(x))
+            logits = self.policy_head(self.policy_body(x))
 
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask, float('-inf'))
@@ -90,41 +112,76 @@ class CatanAlphaZeroNet(nn.Module):
         policy = F.softmax(logits, dim=-1)
         return value.squeeze(-1), policy
 
+    def body_parameters(self):
+        """Return body parameters (shared or value_body+policy_body)."""
+        if self.shared_body:
+            return list(self.body.parameters())
+        else:
+            return list(self.value_body.parameters()) + list(self.policy_body.parameters())
+
+    def value_path_parameters(self):
+        """Return all value-path parameters (body/value_body + value_head)."""
+        if self.shared_body:
+            return list(self.body.parameters()) + list(self.value_head.parameters())
+        else:
+            return list(self.value_body.parameters()) + list(self.value_head.parameters())
+
+    def policy_path_parameters(self):
+        """Return all policy-path parameters (body/policy_body + policy_head)."""
+        if self.shared_body:
+            return list(self.body.parameters()) + list(self.policy_head.parameters())
+        else:
+            return list(self.policy_body.parameters()) + list(self.policy_head.parameters())
+
 
 def warm_start_from_value_net(az_net, value_ckpt_path):
-    """Initialize the shared body and value head from a trained CatanValueNet.
+    """Initialize body and value head from a trained CatanValueNet.
+
+    Only works with body_dims=(256, 128) and dropout=0.0 (matching value_net_v2).
 
     The value_net_v2 architecture is:
-        net.0: Linear(176, 256)  → body.0
-        net.3: Linear(256, 128)  → body.2
-        net.6: Linear(128, 64)   → value_head.0
-        net.8: Linear(64, 1)     → value_head.2
+        net.0: Linear(176, 256)  -> body[0] / value_body[0] / policy_body[0]
+        net.3: Linear(256, 128)  -> body[2] / value_body[2] / policy_body[2]
+        net.6: Linear(128, 64)   -> value_head[0]
+        net.8: Linear(64, 1)     -> value_head[2]
 
     Note: value_net_v2 uses sigmoid output while we use tanh.
-    The last layer bias is adjusted: tanh(x) ≈ 2*sigmoid(x) - 1,
-    so we scale weights by 2 and shift bias by -1 to approximate.
+    The last layer is adjusted: W_new = W_old/2, b_new = b_old/2.
     """
+    assert az_net.body_dims == (256, 128) and az_net.dropout == 0.0, \
+        f"warm_start requires body_dims=(256, 128) dropout=0, got {az_net.body_dims} dropout={az_net.dropout}"
+
     ckpt = torch.load(value_ckpt_path, map_location='cpu', weights_only=False)
     sd = ckpt['model_state_dict']
 
-    # Body: layers 0 and 3 → body.0 and body.2
-    az_net.body[0].weight.data.copy_(sd['net.0.weight'])
-    az_net.body[0].bias.data.copy_(sd['net.0.bias'])
-    az_net.body[2].weight.data.copy_(sd['net.3.weight'])
-    az_net.body[2].bias.data.copy_(sd['net.3.bias'])
+    if az_net.shared_body:
+        # Shared body
+        az_net.body[0].weight.data.copy_(sd['net.0.weight'])
+        az_net.body[0].bias.data.copy_(sd['net.0.bias'])
+        az_net.body[2].weight.data.copy_(sd['net.3.weight'])
+        az_net.body[2].bias.data.copy_(sd['net.3.bias'])
+    else:
+        # Value body
+        az_net.value_body[0].weight.data.copy_(sd['net.0.weight'])
+        az_net.value_body[0].bias.data.copy_(sd['net.0.bias'])
+        az_net.value_body[2].weight.data.copy_(sd['net.3.weight'])
+        az_net.value_body[2].bias.data.copy_(sd['net.3.bias'])
 
-    # Value head: layers 6 and 8 → value_head.0 and value_head.2
+        # Policy body: same starting weights
+        az_net.policy_body[0].weight.data.copy_(sd['net.0.weight'])
+        az_net.policy_body[0].bias.data.copy_(sd['net.0.bias'])
+        az_net.policy_body[2].weight.data.copy_(sd['net.3.weight'])
+        az_net.policy_body[2].bias.data.copy_(sd['net.3.bias'])
+
+    # Value head
     az_net.value_head[0].weight.data.copy_(sd['net.6.weight'])
     az_net.value_head[0].bias.data.copy_(sd['net.6.bias'])
 
     # Last layer: convert from sigmoid to tanh space
-    # sigmoid(x) maps to [0,1], tanh(x) maps to [-1,1]
-    # tanh(x) = 2*sigmoid(2x) - 1, but approximately:
-    # Just scale output weight/bias so the pre-activation range is similar
-    az_net.value_head[2].weight.data.copy_(sd['net.8.weight'])
-    az_net.value_head[2].bias.data.copy_(sd['net.8.bias'])
+    az_net.value_head[2].weight.data.copy_(sd['net.8.weight'] * 0.5)
+    az_net.value_head[2].bias.data.copy_(sd['net.8.bias'] * 0.5)
 
-    # Policy head: initialize with small random weights (Xavier)
+    # Policy head: Xavier init
     nn.init.xavier_uniform_(az_net.policy_head[0].weight)
     nn.init.zeros_(az_net.policy_head[0].bias)
     nn.init.xavier_uniform_(az_net.policy_head[2].weight)
@@ -229,6 +286,9 @@ def save_checkpoint(az_net, optimizer, iteration, feature_names, feature_means,
         'feature_stds': feature_stds,
         'input_dim': az_net.input_dim,
         'num_actions': az_net.num_actions,
+        'body_dims': list(az_net.body_dims),
+        'dropout': az_net.dropout,
+        'shared_body': az_net.shared_body,
     }
     if extra:
         data.update(extra)
@@ -236,12 +296,36 @@ def save_checkpoint(az_net, optimizer, iteration, feature_names, feature_means,
 
 
 def load_checkpoint(path, device='cpu'):
-    """Load AlphaZero checkpoint, returning model and metadata."""
+    """Load AlphaZero checkpoint, returning model and metadata.
+
+    Handles all checkpoint formats:
+    - New format: has body_dims, dropout, shared_body stored explicitly
+    - Old shared body: has 'body.*' keys in state dict
+    - Old split body: has 'value_body.*' + 'policy_body.*' keys
+    """
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    sd = ckpt['model_state_dict']
+
+    body_dims = tuple(ckpt.get('body_dims', (256, 128)))
+    dropout_val = ckpt.get('dropout', 0.0)
+
+    # Determine shared vs split body
+    if 'shared_body' in ckpt:
+        shared = ckpt['shared_body']
+    else:
+        # Old checkpoint: detect from state dict keys
+        has_body = any(k.startswith('body.') for k in sd)
+        has_split = any(k.startswith('value_body.') for k in sd)
+        shared = has_body and not has_split
+
     net = CatanAlphaZeroNet(
         input_dim=ckpt.get('input_dim', 176),
         num_actions=ckpt.get('num_actions', ACTION_SPACE_SIZE),
+        body_dims=body_dims,
+        dropout=dropout_val,
+        shared_body=shared,
     )
-    net.load_state_dict(ckpt['model_state_dict'])
+
+    net.load_state_dict(sd)
     net.eval()
     return net, ckpt

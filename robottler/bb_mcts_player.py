@@ -16,14 +16,15 @@ import time
 import numpy as np
 import torch
 
-from catanatron.models.enums import ActionType, Action, ActionRecord
+from catanatron.models.enums import ActionType, Action
 from catanatron.models.map import number_probability
 from catanatron.models.player import Player
-from catanatron.state_functions import get_actual_victory_points
 
+from catanatron.gym.envs.catanatron_env import (
+    ACTION_SPACE_SIZE, to_action_space,
+)
 from robottler.alphazero_net import (
-    CatanAlphaZeroNet, bb_actions_to_mask, policy_to_action_priors,
-    load_checkpoint,
+    CatanAlphaZeroNet, load_checkpoint,
 )
 from robottler.bitboard.convert import game_to_bitboard, DEV_ID_TO_NAME
 from robottler.bitboard.movegen import bb_generate_actions
@@ -53,7 +54,7 @@ class BBMCTSNode:
     __slots__ = (
         'bb_state', 'parent', 'action', 'children', 'visit_count',
         'value_sum', 'prior', 'is_expanded', 'is_chance',
-        'is_terminal', '_winner_pidx',
+        'is_terminal', '_winner_pidx', '_cached_actions',
     )
 
     def __init__(self, bb_state, parent=None, action=None, prior=0.0):
@@ -69,12 +70,13 @@ class BBMCTSNode:
         self.is_chance = False
         self.is_terminal = False
         self._winner_pidx = -1
+        self._cached_actions = None
 
         if bb_state is not None:
             self._init_from_state(bb_state)
 
     def _init_from_state(self, bb_state):
-        """Initialize terminal/chance status."""
+        """Initialize terminal/chance status and cache actions."""
         w = bb_state.winning_player()
         if w >= 0:
             self.is_terminal = True
@@ -86,6 +88,7 @@ class BBMCTSNode:
             return
 
         actions = bb_generate_actions(bb_state)
+        self._cached_actions = actions
         if len(actions) == 1 and actions[0].action_type in STOCHASTIC_ACTIONS:
             self.is_chance = True
             self.children = {}  # dict for chance nodes
@@ -161,7 +164,7 @@ class BBMCTSPlayer(Player):
     def __init__(self, color, az_net, feature_indexer, feature_means, feature_stds,
                  num_simulations=800, c_puct=1.4, time_limit=None,
                  dirichlet_alpha=0.3, dirichlet_weight=0.25,
-                 temperature=0.0, is_bot=True):
+                 temperature=0.0, is_bot=True, leaf_value_fn=None):
         super().__init__(color, is_bot)
         self.az_net = az_net
         self.fi = feature_indexer
@@ -174,9 +177,13 @@ class BBMCTSPlayer(Player):
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_weight = dirichlet_weight
         self.temperature = temperature
+        self.leaf_value_fn = leaf_value_fn
 
-        # Pre-allocate feature buffer
+        # Pre-allocate buffers
         self._feat_buf = np.zeros(self.n_features, dtype=np.float32)
+        self._feat_tensor = torch.zeros(1, self.n_features, dtype=torch.float32)
+        self._mask_buf = np.zeros(ACTION_SPACE_SIZE, dtype=bool)
+        self._mask_tensor = torch.zeros(1, ACTION_SPACE_SIZE, dtype=torch.bool)
 
     def decide(self, game, playable_actions):
         if len(playable_actions) == 1:
@@ -190,8 +197,7 @@ class BBMCTSPlayer(Player):
         root = BBMCTSNode(bb_state.copy())
 
         if not root.is_expanded and not root.is_terminal:
-            actions = bb_generate_actions(root.bb_state)
-            self._expand(root, actions)
+            self._expand(root, root._cached_actions)
 
         # Dirichlet noise at root
         if self.dirichlet_alpha > 0 and isinstance(root.children, list) and len(root.children) > 0:
@@ -246,7 +252,7 @@ class BBMCTSPlayer(Player):
         if node.is_terminal:
             value = self._terminal_value(node)
         else:
-            actions = bb_generate_actions(node.bb_state)
+            actions = node._cached_actions
             value = self._evaluate_and_expand(node, actions)
 
         # BACKPROPAGATE
@@ -255,40 +261,88 @@ class BBMCTSPlayer(Player):
     def _evaluate_and_expand(self, node, actions):
         """Evaluate leaf with neural net and expand children with policy priors.
 
+        Merges mask building + prior extraction into a single to_action_space pass.
         Returns value from the perspective of the MCTS player.
+
+        When leaf_value_fn is set, uses external value function + uniform priors
+        instead of the AZ network (for blend-bootstrap self-play).
         """
         bb = node.bb_state
 
-        # Extract features
+        # --- External leaf value function path (blend bootstrap) ---
+        if self.leaf_value_fn is not None:
+            value = self.leaf_value_fn(bb, self.color)
+
+            # Uniform priors — no trained policy available
+            uniform = 1.0 / len(actions) if actions else 0.0
+            node.children = []
+            for action in actions:
+                child = BBMCTSNode(None, parent=node, action=action, prior=uniform)
+                node.children.append((action, child))
+
+            node.is_expanded = True
+            node._cached_actions = None
+            return value
+
+        # --- Standard AZ network path ---
+
+        # Extract features into pre-allocated buffer
         self._feat_buf[:] = 0.0
         bb_fill_feature_vector(bb, self.color, self._feat_buf, self.fi)
 
-        # Normalize
-        x = torch.from_numpy(self._feat_buf.copy())
-        x = (x - self.means) / self.stds
-        x = x.unsqueeze(0)
+        # Normalize into pre-allocated tensor (no copy — write directly)
+        ft = self._feat_tensor
+        ft[0] = torch.from_numpy(self._feat_buf)
+        ft[0].sub_(self.means).div_(self.stds)
 
-        # Build action mask
-        mask_np, valid_pairs = bb_actions_to_mask(actions)
-        mask = torch.tensor(mask_np, dtype=torch.bool).unsqueeze(0)
+        # Build action mask + collect indices in ONE pass
+        self._mask_buf[:] = False
+        action_indices = []  # (action, space_index) pairs
+        for action in actions:
+            try:
+                idx = to_action_space(action)
+                self._mask_buf[idx] = True
+                action_indices.append((action, idx))
+            except (ValueError, KeyError):
+                action_indices.append((action, -1))
+
+        # Copy mask to pre-allocated tensor
+        mt = self._mask_tensor
+        np.copyto(mt.numpy()[0], self._mask_buf)
 
         # Forward pass
         with torch.inference_mode():
-            value, policy = self.az_net.predict(x, mask)
+            value, policy = self.az_net.predict(ft, mt)
 
-        value = value.item()  # scalar in [-1, +1]
-        policy_np = policy.squeeze(0).numpy()
+        value = value.item()
+        policy_np = policy[0].numpy()
 
-        # Create children with policy priors
-        priors = policy_to_action_priors(policy_np, actions)
+        # Build children with priors from the SAME index pass
+        total_p = 0.0
+        raw_priors = []
+        for action, idx in action_indices:
+            if idx >= 0:
+                p = float(policy_np[idx])
+            else:
+                p = 0.0
+            raw_priors.append(p)
+            total_p += p
 
         node.children = []
-        for action in actions:
-            prior = priors.get(action, 0.0)
-            child = BBMCTSNode(None, parent=node, action=action, prior=prior)
-            node.children.append((action, child))
+        if total_p > 1e-8:
+            inv = 1.0 / total_p
+            for i, (action, _idx) in enumerate(action_indices):
+                prior = raw_priors[i] * inv
+                child = BBMCTSNode(None, parent=node, action=action, prior=prior)
+                node.children.append((action, child))
+        else:
+            uniform = 1.0 / len(actions) if actions else 0.0
+            for action, _idx in action_indices:
+                child = BBMCTSNode(None, parent=node, action=action, prior=uniform)
+                node.children.append((action, child))
 
         node.is_expanded = True
+        node._cached_actions = None  # free memory — no longer needed
         return value
 
     def _expand(self, node, actions):
@@ -303,7 +357,7 @@ class BBMCTSPlayer(Player):
     def _select_chance(self, node, action=None):
         """Sample a chance outcome."""
         if action is None:
-            actions = bb_generate_actions(node.bb_state)
+            actions = node._cached_actions
             if not actions:
                 return node
             action = actions[0]

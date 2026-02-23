@@ -63,6 +63,7 @@ ACTIONS_ARRAY = [
     (ActionType.END_TURN, None),
 ]
 ACTION_SPACE_SIZE = len(ACTIONS_ARRAY)
+_ACTION_TO_INDEX = {v: i for i, v in enumerate(ACTIONS_ARRAY)}
 ACTION_TYPES = [i for i in ActionType]
 
 
@@ -89,7 +90,7 @@ def normalize_action(action):
 def to_action_space(action):
     """maps action to space_action equivalent integer"""
     normalized = normalize_action(action)
-    return ACTIONS_ARRAY.index((normalized.action_type, normalized.value))
+    return _ACTION_TO_INDEX[(normalized.action_type, normalized.value)]
 
 
 def from_action_space(action_int, playable_actions):

@@ -32,6 +32,20 @@ Usage:
         --start-checkpoint robottler/models/az_iter0.pt \
         --iterations 10 --games-per-iter 500 --sims 400 \
         --output-dir datasets/az_selfplay
+
+    # Expert Iteration: generate data with search player
+    python3 -m robottler.az_selfplay expert \
+        --bc-model robottler/models/value_net_v2.pt \
+        --games 1000 --search-depth 2 --dice-sample 5 \
+        --output-dir datasets/expert_data --workers 6
+
+    # ExIt loop: expert generation + differential LR training
+    python3 -m robottler.az_selfplay loop \
+        --start-checkpoint robottler/models/az_iter0.pt \
+        --expert --bc-model robottler/models/value_net_v2.pt \
+        --search-depth 2 --dice-sample 5 --differential-lr \
+        --iterations 10 --games-per-iter 500 \
+        --output-dir datasets/exit_v1 --workers 6
 """
 
 import argparse
@@ -68,6 +82,109 @@ from robottler.bb_mcts_player import BBMCTSPlayer, BBMCTSNode, make_bb_mcts_play
 from robottler.bitboard.convert import game_to_bitboard
 from robottler.bitboard.features import FeatureIndexer, bb_fill_feature_vector
 from robottler.bitboard.movegen import bb_generate_actions
+
+
+# ---------------------------------------------------------------------------
+# Blend bootstrap: full blend (heuristic + neural) as MCTS leaf evaluator
+# ---------------------------------------------------------------------------
+
+def make_blend_leaf_fn(bc_path, blend_weight=1e8):
+    """Create a blend leaf evaluator for MCTS bootstrap.
+
+    Uses the full alpha-beta blend (heuristic + neural) with two-tier
+    normalization to map values into [-1, +1] for MCTS backpropagation.
+
+    blend_weight=1e8 matches the proven alpha-beta config (69-83% vs AB).
+    At 1e8, neural (~1e7) is a tiebreaker below production (~1e8).
+    At 1e10, neural drowns out everything except VPs — don't use it.
+
+    The raw blend spans ~14 orders of magnitude (VP weight 3e14 vs
+    production 1e8). A single tanh scale crushes sub-VP differences to
+    noise. Instead we decompose the advantage into:
+      1. VP signal: tanh(vp_diff / 4) * 0.6  — coarse win proximity
+      2. Sub-VP signal: tanh(sub_vp_adv / 3e8) * 0.4  — production,
+         neural, reachability differences
+
+    Sub-VP differences (~0.01–0.27) stay above MCTS exploration noise
+    (~0.02 for c_puct=1.4, uniform priors), so the blend's strategic
+    information actually guides search.
+
+    Args:
+        bc_path: Path to value_net_v2.pt (BC-trained checkpoint)
+        blend_weight: Weight for neural component in blend (default 1e8)
+    """
+    import math
+    from robottler.value_model import CatanValueNet
+    from robottler.search_player import _bb_heuristic
+    from robottler.bitboard.state import PS_VP
+
+    VP_HEURISTIC_WEIGHT = 3e14  # from DEFAULT_WEIGHTS["public_vps"]
+
+    # Load BC neural net (shared across both perspective evaluations)
+    checkpoint = torch.load(bc_path, map_location="cpu", weights_only=False)
+    feature_names = checkpoint["feature_names"]
+    n_features = len(feature_names)
+    feature_index_map = {name: idx for idx, name in enumerate(feature_names)}
+    means_np = checkpoint["feature_means"].astype(np.float32)
+    stds_np = checkpoint["feature_stds"].astype(np.float32)
+
+    model = CatanValueNet(input_dim=n_features)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    # Two buffers: one per perspective to avoid re-zeroing between evals
+    buf_a = np.zeros(n_features, dtype=np.float32)
+    buf_b = np.zeros(n_features, dtype=np.float32)
+    fi = None  # lazy-init
+
+    def _blend_one(bb_state, color, buf):
+        """Evaluate blend for a single perspective. Returns raw blend value."""
+        buf[:] = 0.0
+        bb_fill_feature_vector(bb_state, color, buf, fi)
+        np.subtract(buf, means_np, out=buf)
+        np.divide(buf, stds_np, out=buf)
+        x = torch.from_numpy(buf).unsqueeze(0)
+        with torch.inference_mode():
+            n = torch.sigmoid(model(x)).item()
+        h = _bb_heuristic(bb_state, color, fi.node_prod)
+        return h + blend_weight * n
+
+    def leaf_fn(bb_state, color):
+        nonlocal fi
+        if fi is None:
+            fi = FeatureIndexer(feature_index_map, bb_state.catan_map)
+        else:
+            fi.update_map(bb_state.catan_map)
+
+        # Evaluate from both perspectives (shared model + FeatureIndexer)
+        my_idx = bb_state.color_to_index[color]
+        opp_idx = (my_idx + 1) % bb_state.num_players
+        opp_color = bb_state.colors[opp_idx]
+
+        my_blend = _blend_one(bb_state, color, buf_a)
+        opp_blend = _blend_one(bb_state, opp_color, buf_b)
+
+        # VP counts
+        my_vps = float(bb_state.player_state[my_idx][PS_VP])
+        opp_vps = float(bb_state.player_state[opp_idx][PS_VP])
+        vp_diff = my_vps - opp_vps
+
+        # Decompose: remove VP component to isolate sub-VP blend
+        adv = my_blend - opp_blend
+        vp_component = vp_diff * VP_HEURISTIC_WEIGHT
+        sub_vp_adv = adv - vp_component
+
+        # Two-tier normalization
+        # VP: 1 VP → 0.15, 2 VP → 0.28, 5 VP → 0.51
+        vp_signal = math.tanh(vp_diff / 4.0) * 0.6
+
+        # Sub-VP: production ~2e8, neural ~1e7 (at blend_weight=1e8)
+        # 3e8 scale keeps production diffs at ~0.23, neural at ~0.01-0.07
+        sub_signal = math.tanh(sub_vp_adv / 3e8) * 0.4
+
+        return max(-1.0, min(1.0, vp_signal + sub_signal))
+
+    return leaf_fn
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +339,13 @@ def generate_one_game(az_net, feature_indexer, feature_means, feature_stds,
 
 def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
                          num_simulations=400, c_puct=1.4, temperature_threshold=15,
-                         vps_to_win=10):
+                         vps_to_win=10, leaf_value_fn=None):
     """Play one self-play game with proper color tracking.
+
+    Args:
+        leaf_value_fn: Optional external leaf evaluator fn(bb_state, color) -> [-1,+1].
+            When set, MCTS uses this for value estimation with uniform priors
+            instead of the AZ network (for blend-bootstrap self-play).
 
     Returns:
         records: list of (features, policy_target, color) tuples
@@ -239,6 +361,7 @@ def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
         num_simulations=num_simulations, c_puct=c_puct,
         temperature=1.0,
         dirichlet_alpha=0.3, dirichlet_weight=0.25,
+        leaf_value_fn=leaf_value_fn,
     )
     p2 = BBMCTSPlayer(
         color=Color.BLUE, az_net=az_net,
@@ -247,6 +370,7 @@ def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
         num_simulations=num_simulations, c_puct=c_puct,
         temperature=1.0,
         dirichlet_alpha=0.3, dirichlet_weight=0.25,
+        leaf_value_fn=leaf_value_fn,
     )
 
     game = Game(players=[p1, p2], vps_to_win=vps_to_win)
@@ -336,6 +460,344 @@ def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
 
 
 # ---------------------------------------------------------------------------
+# Expert Iteration: self-play with BitboardSearchPlayer
+# ---------------------------------------------------------------------------
+
+def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, feature_stds,
+                             search_depth=2, dice_sample_size=5, vps_to_win=10,
+                             blend_leaf_fn=None):
+    """Play one game with BitboardSearchPlayer (both sides) for ExIt training.
+
+    Records:
+    - Features (176-dim, same as MCTS path)
+    - One-hot policy target: the search player's chosen action
+    - Value target: continuous blend evaluation (if blend_leaf_fn provided),
+      or binary +1/-1 game outcome (fallback)
+
+    Args:
+        bb_value_fn: Bitboard value function (from make_bb_blended_value_fn)
+        feature_indexer: FeatureIndexer instance
+        feature_means, feature_stds: normalization arrays
+        search_depth: search depth for BitboardSearchPlayer
+        dice_sample_size: number of dice outcomes to sample
+        vps_to_win: victory points to win
+        blend_leaf_fn: Optional fn(bb_state, color) -> float in [-1, +1].
+            When provided, records continuous blend evaluation as value target
+            instead of binary game outcome. Use make_blend_leaf_fn() to create.
+
+    Returns:
+        records: list of SelfPlayRecord
+        winner: Color or None
+        num_turns: int
+    """
+    from robottler.search_player import BitboardSearchPlayer
+
+    n_features = len(feature_means)
+
+    p1 = BitboardSearchPlayer(
+        color=Color.RED, bb_value_fn=bb_value_fn,
+        depth=search_depth, prunning=False,
+        dice_sample_size=dice_sample_size,
+    )
+    p2 = BitboardSearchPlayer(
+        color=Color.BLUE, bb_value_fn=bb_value_fn,
+        depth=search_depth, prunning=False,
+        dice_sample_size=dice_sample_size,
+    )
+
+    game = Game(players=[p1, p2], vps_to_win=vps_to_win)
+    feature_indexer.update_map(game.state.board.map)
+
+    raw_records = []  # (features, policy_target, color, value_target_or_None)
+    feat_buf = np.zeros(n_features, dtype=np.float32)
+
+    while game.winning_color() is None and game.state.num_turns < 1000:
+        actions = game.playable_actions
+        current = game.state.current_player()
+
+        if len(actions) == 1:
+            game.execute(actions[0])
+            continue
+
+        if not isinstance(current, BitboardSearchPlayer):
+            game.execute(actions[0])
+            continue
+
+        # Extract features BEFORE the decision
+        bb_state = game_to_bitboard(game)
+        feat_buf[:] = 0.0
+        bb_fill_feature_vector(bb_state, current.color, feat_buf, feature_indexer)
+
+        # Compute blend value target if available
+        blend_value = None
+        if blend_leaf_fn is not None:
+            blend_value = blend_leaf_fn(bb_state, current.color)
+
+        # Get the search player's chosen action
+        chosen = current.decide(game, actions)
+
+        # One-hot policy target
+        policy_target = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+        try:
+            idx = to_action_space(chosen)
+            policy_target[idx] = 1.0
+        except (ValueError, IndexError):
+            # Action not in standard space — skip this record
+            game.execute(chosen)
+            continue
+
+        raw_records.append((feat_buf.copy(), policy_target, current.color, blend_value))
+        game.execute(chosen)
+
+    winner = game.winning_color()
+
+    # Convert to SelfPlayRecords with value targets
+    records = []
+    for features, policy_target, color, blend_value in raw_records:
+        if blend_value is not None:
+            # Use continuous blend evaluation
+            value_target = blend_value
+        elif winner is None:
+            value_target = 0.0
+        elif winner == color:
+            value_target = 1.0
+        else:
+            value_target = -1.0
+        records.append(SelfPlayRecord(features, policy_target, value_target))
+
+    return records, winner, game.state.num_turns
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing workers for expert iteration
+# ---------------------------------------------------------------------------
+
+_expert_worker_value_fn = None
+_expert_worker_fi = None
+_expert_worker_means = None
+_expert_worker_stds = None
+_expert_worker_kwargs = None
+_expert_worker_blend_leaf_fn = None
+
+
+def _expert_worker_init(bc_path, blend_weight, search_depth, dice_sample_size,
+                         vps_to_win, distill_values):
+    """Initialize per-worker state for expert iteration: load blend value fn."""
+    global _expert_worker_value_fn, _expert_worker_fi
+    global _expert_worker_means, _expert_worker_stds, _expert_worker_kwargs
+    global _expert_worker_blend_leaf_fn
+
+    from robottler.search_player import make_bb_blended_value_fn
+
+    _expert_worker_value_fn = make_bb_blended_value_fn(bc_path, blend_weight=blend_weight)
+
+    # Create blend leaf fn for value distillation if requested
+    _expert_worker_blend_leaf_fn = None
+    if distill_values:
+        _expert_worker_blend_leaf_fn = make_blend_leaf_fn(bc_path, blend_weight=1e8)
+
+    # Load feature info from the AZ checkpoint (or BC checkpoint) for feature extraction
+    ckpt = torch.load(bc_path, map_location="cpu", weights_only=False)
+    feat_names = ckpt['feature_names']
+    _expert_worker_means = ckpt['feature_means']
+    _expert_worker_stds = ckpt['feature_stds']
+    feature_index_map = {name: i for i, name in enumerate(feat_names)}
+
+    from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
+    catan_map = build_map(BASE_MAP_TEMPLATE)
+    _expert_worker_fi = FeatureIndexer(feature_index_map, catan_map)
+
+    _expert_worker_kwargs = {
+        'search_depth': search_depth,
+        'dice_sample_size': dice_sample_size,
+        'vps_to_win': vps_to_win,
+    }
+
+
+def _expert_worker_play_one(_game_idx):
+    """Play one expert game in a worker."""
+    records, winner, turns = generate_one_game_expert(
+        _expert_worker_value_fn, _expert_worker_fi,
+        _expert_worker_means, _expert_worker_stds,
+        blend_leaf_fn=_expert_worker_blend_leaf_fn,
+        **_expert_worker_kwargs,
+    )
+    features = [r.features for r in records]
+    policies = [r.policy_target for r in records]
+    values = [r.value_target for r in records]
+    return (features, policies, values, str(winner), turns)
+
+
+def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5,
+                          blend_weight=1e10, vps_to_win=10, output_dir=None,
+                          workers=1, distill_values=False):
+    """Generate expert iteration data using BitboardSearchPlayer.
+
+    Same output format as generate_games() (features.npy, policies.npy, values.npy)
+    so training code works unchanged.
+
+    Args:
+        bc_path: Path to BC value net (e.g., value_net_v2.pt) for blend value fn
+        num_games: Number of games to generate
+        search_depth: Search depth for BitboardSearchPlayer
+        dice_sample_size: Number of dice outcomes to sample
+        blend_weight: Weight for neural component in blend (default 1e10)
+        vps_to_win: Victory points to win
+        output_dir: Directory to save data (with resume support)
+        workers: Number of parallel worker processes
+
+    Returns:
+        all_records: list of SelfPlayRecord
+        stats: dict with game statistics
+    """
+    from robottler.search_player import make_bb_blended_value_fn
+
+    # Check for existing progress
+    start_game = 0
+    all_records = []
+    total_turns = 0
+    winners = {Color.RED: 0, Color.BLUE: 0, None: 0}
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        progress_path = os.path.join(output_dir, '_progress.json')
+        if os.path.exists(progress_path):
+            with open(progress_path) as f:
+                prog = json.load(f)
+            start_game = prog.get('games_completed', 0)
+            total_turns = prog.get('total_turns', 0)
+            for k, v in prog.get('winners', {}).items():
+                if k in ('None', 'null'):
+                    winners[None] = v
+                else:
+                    name = k.replace('Color.', '') if k.startswith('Color.') else k
+                    winners[Color[name]] = v
+            if start_game >= num_games:
+                print(f"  Already completed {start_game}/{num_games} games, skipping")
+                if os.path.exists(os.path.join(output_dir, 'features.npy')):
+                    feats, pols, vals = load_records(output_dir)
+                    for i in range(len(vals)):
+                        all_records.append(SelfPlayRecord(feats[i], pols[i], vals[i]))
+                stats = {
+                    'num_games': num_games,
+                    'total_records': len(all_records),
+                    'avg_turns': total_turns / max(num_games, 1),
+                    'avg_records_per_game': len(all_records) / max(num_games, 1),
+                    'winners': {str(k): v for k, v in winners.items()},
+                }
+                return all_records, stats
+            elif start_game > 0:
+                print(f"  Resuming from game {start_game}/{num_games}")
+                if os.path.exists(os.path.join(output_dir, 'features.npy')):
+                    feats, pols, vals = load_records(output_dir)
+                    for i in range(len(vals)):
+                        all_records.append(SelfPlayRecord(feats[i], pols[i], vals[i]))
+
+    remaining = num_games - start_game
+
+    if workers <= 1:
+        # Sequential path
+        bb_value_fn = make_bb_blended_value_fn(bc_path, blend_weight=blend_weight)
+        seq_blend_leaf_fn = make_blend_leaf_fn(bc_path, blend_weight=1e8) if distill_values else None
+
+        ckpt = torch.load(bc_path, map_location="cpu", weights_only=False)
+        feat_names = ckpt['feature_names']
+        feat_means = ckpt['feature_means']
+        feat_stds = ckpt['feature_stds']
+        feature_index_map = {name: i for i, name in enumerate(feat_names)}
+
+        from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
+        catan_map = build_map(BASE_MAP_TEMPLATE)
+        fi = FeatureIndexer(feature_index_map, catan_map)
+
+        for i in tqdm(range(start_game, num_games), desc="Expert games",
+                      initial=start_game, total=num_games):
+            records, winner, turns = generate_one_game_expert(
+                bb_value_fn, fi, feat_means, feat_stds,
+                search_depth=search_depth,
+                dice_sample_size=dice_sample_size,
+                vps_to_win=vps_to_win,
+                blend_leaf_fn=seq_blend_leaf_fn,
+            )
+            all_records.extend(records)
+            total_turns += turns
+            winners[winner] = winners.get(winner, 0) + 1
+
+            if output_dir is not None:
+                save_records(all_records, output_dir, quiet=True)
+                with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
+                    json.dump({
+                        'games_completed': i + 1,
+                        'total_games': num_games,
+                        'total_turns': total_turns,
+                        'total_records': len(all_records),
+                        'winners': {str(k): v for k, v in winners.items()},
+                        'method': 'expert',
+                    }, f)
+    else:
+        # Parallel path — save incrementally after each game completes
+        print(f"Using {workers} parallel workers for expert game generation")
+        if distill_values:
+            print(f"  Value distillation enabled (blend leaf fn)")
+        games_done = start_game
+        with mp.Pool(
+            processes=workers,
+            initializer=_expert_worker_init,
+            initargs=(bc_path, blend_weight, search_depth, dice_sample_size,
+                      vps_to_win, distill_values),
+        ) as pool:
+            for result in tqdm(
+                pool.imap_unordered(_expert_worker_play_one, range(remaining)),
+                total=remaining, desc="Expert games", initial=start_game,
+            ):
+                features_list, policies_list, values_list, winner_str, turns = result
+                for feat, pol, val in zip(features_list, policies_list, values_list):
+                    all_records.append(SelfPlayRecord(feat, pol, val))
+                total_turns += turns
+                if winner_str in ('None', 'null'):
+                    winners[None] = winners.get(None, 0) + 1
+                else:
+                    name = winner_str.replace('Color.', '') if winner_str.startswith('Color.') else winner_str
+                    winners[Color[name]] = winners.get(Color[name], 0) + 1
+
+                games_done += 1
+                # Save every 10 games
+                if output_dir is not None and games_done % 10 == 0:
+                    save_records(all_records, output_dir, quiet=True)
+                    with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
+                        json.dump({
+                            'games_completed': games_done,
+                            'total_games': num_games,
+                            'total_turns': total_turns,
+                            'total_records': len(all_records),
+                            'winners': {str(k): v for k, v in winners.items()},
+                            'method': 'expert',
+                        }, f)
+
+        # Final save
+        if output_dir is not None:
+            save_records(all_records, output_dir, quiet=True)
+            with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
+                json.dump({
+                    'games_completed': games_done,
+                    'total_games': num_games,
+                    'total_turns': total_turns,
+                    'total_records': len(all_records),
+                    'winners': {str(k): v for k, v in winners.items()},
+                    'method': 'expert',
+                }, f)
+
+    stats = {
+        'num_games': num_games,
+        'total_records': len(all_records),
+        'avg_turns': total_turns / max(num_games, 1),
+        'avg_records_per_game': len(all_records) / max(num_games, 1),
+        'winners': {str(k): v for k, v in winners.items()},
+    }
+    return all_records, stats
+
+
+# ---------------------------------------------------------------------------
 # Multiprocessing worker for parallel self-play
 # ---------------------------------------------------------------------------
 
@@ -344,12 +806,14 @@ _az_worker_fi = None
 _az_worker_means = None
 _az_worker_stds = None
 _az_worker_kwargs = None
+_az_worker_leaf_fn = None
 
 
 def _az_worker_init(checkpoint_path, num_simulations, c_puct,
-                    temperature_threshold, vps_to_win):
+                    temperature_threshold, vps_to_win, blend_bootstrap_path=None):
     """Initialize per-worker state: load model, build FeatureIndexer."""
-    global _az_worker_net, _az_worker_fi, _az_worker_means, _az_worker_stds, _az_worker_kwargs
+    global _az_worker_net, _az_worker_fi, _az_worker_means, _az_worker_stds
+    global _az_worker_kwargs, _az_worker_leaf_fn
 
     net, ckpt = load_checkpoint(checkpoint_path)
     feat_names = ckpt['feature_names']
@@ -361,11 +825,18 @@ def _az_worker_init(checkpoint_path, num_simulations, c_puct,
     catan_map = build_map(BASE_MAP_TEMPLATE)
     _az_worker_fi = FeatureIndexer(feature_index_map, catan_map)
     _az_worker_net = net
+
+    # Create blend bootstrap leaf fn if requested (each worker gets its own)
+    _az_worker_leaf_fn = None
+    if blend_bootstrap_path is not None:
+        _az_worker_leaf_fn = make_blend_leaf_fn(blend_bootstrap_path)
+
     _az_worker_kwargs = {
         'num_simulations': num_simulations,
         'c_puct': c_puct,
         'temperature_threshold': temperature_threshold,
         'vps_to_win': vps_to_win,
+        'leaf_value_fn': _az_worker_leaf_fn,
     }
 
 
@@ -384,13 +855,17 @@ def _az_worker_play_one(_game_idx):
 
 def generate_games(checkpoint_path, num_games, num_simulations=400,
                    c_puct=1.4, temperature_threshold=15, vps_to_win=10,
-                   output_dir=None, workers=1):
+                   output_dir=None, workers=1, blend_bootstrap_path=None):
     """Generate multiple self-play games with incremental saving.
 
     If output_dir is provided, saves after every game so progress survives
     interruption. On resume, skips already-completed games.
 
-    workers: number of parallel processes (1 = sequential).
+    Args:
+        workers: number of parallel processes (1 = sequential).
+        blend_bootstrap_path: Path to BC value net (e.g., value_net_v2.pt).
+            When set, uses the BC neural net as MCTS leaf evaluator with
+            uniform priors instead of the AZ network.
 
     Returns:
         all_records: list of SelfPlayRecord
@@ -439,6 +914,12 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
 
     remaining = num_games - start_game
 
+    # Create blend bootstrap leaf fn if requested
+    leaf_value_fn = None
+    if blend_bootstrap_path is not None:
+        leaf_value_fn = make_blend_leaf_fn(blend_bootstrap_path)
+        print(f"  Using blend bootstrap from {blend_bootstrap_path}")
+
     if workers <= 1:
         # Sequential path — load model once
         net, ckpt = load_checkpoint(checkpoint_path)
@@ -459,6 +940,7 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
                 c_puct=c_puct,
                 temperature_threshold=temperature_threshold,
                 vps_to_win=vps_to_win,
+                leaf_value_fn=leaf_value_fn,
             )
             all_records.extend(records)
             total_turns += turns
@@ -482,7 +964,7 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
             processes=workers,
             initializer=_az_worker_init,
             initargs=(checkpoint_path, num_simulations, c_puct,
-                      temperature_threshold, vps_to_win),
+                      temperature_threshold, vps_to_win, blend_bootstrap_path),
         ) as pool:
             game_results = list(tqdm(
                 pool.imap_unordered(_az_worker_play_one, range(remaining)),
@@ -554,7 +1036,11 @@ def load_records(data_dir):
 # ---------------------------------------------------------------------------
 
 class SelfPlayDataset(Dataset):
-    """PyTorch dataset for self-play data."""
+    """PyTorch dataset for self-play data.
+
+    Supports mixed self-play + human data. Human samples have all-zero
+    policy targets (policy loss is masked out for them).
+    """
 
     def __init__(self, features, policies, values, means, stds):
         # Normalize features
@@ -569,30 +1055,142 @@ class SelfPlayDataset(Dataset):
         return self.features[idx], self.policies[idx], self.values[idx]
 
 
-def train_on_data(checkpoint_path, data_dirs, output_path, epochs=20,
-                  batch_size=256, lr=1e-3, value_weight=1.0):
-    """Train AlphaZero network on self-play data.
+def _load_human_data(parquet_dir, feature_names, max_samples=None):
+    """Load human game data from parquet shards for AZ training.
+
+    Extracts the 176 strategic features matching the AZ network, with
+    value targets from game outcomes. Policy targets are all-zero
+    (policy loss is skipped for human samples).
+
+    Args:
+        parquet_dir: Path to parquet shard directory (e.g., datasets/parquet)
+        feature_names: List of 176 feature names from AZ checkpoint
+        max_samples: Cap on number of human samples to load (None = all)
+
+    Returns:
+        features: (N, 176) float32
+        policies: (N, 290) float32 — all zeros (no visit distribution)
+        values: (N,) float32 — +1 win, -1 loss
+    """
+    import glob
+    import pandas as pd
+
+    f_cols = [f"F_{name}" for name in feature_names]
+    read_cols = f_cols + ["winner"]
+
+    shard_files = sorted(glob.glob(os.path.join(parquet_dir, "shard_*.parquet")))
+    if not shard_files:
+        raise FileNotFoundError(f"No shard_*.parquet files in {parquet_dir}")
+
+    all_features = []
+    all_values = []
+    total = 0
+
+    for path in shard_files:
+        df = pd.read_parquet(path, columns=read_cols)
+        feats = df[f_cols].values.astype(np.float32)
+        # Human data: winner=1.0 means this perspective won
+        # Map to AZ convention: +1 win, -1 loss
+        vals = df["winner"].values.astype(np.float32) * 2.0 - 1.0
+
+        all_features.append(feats)
+        all_values.append(vals)
+        total += len(vals)
+
+        if max_samples and total >= max_samples:
+            break
+
+    features = np.concatenate(all_features)
+    values = np.concatenate(all_values)
+
+    if max_samples and len(features) > max_samples:
+        idx = np.random.choice(len(features), max_samples, replace=False)
+        features = features[idx]
+        values = values[idx]
+
+    # All-zero policies — policy loss will be masked out for these samples
+    policies = np.zeros((len(features), ACTION_SPACE_SIZE), dtype=np.float32)
+
+    print(f"  Loaded {len(features)} human samples from {parquet_dir}")
+    return features, policies, values
+
+
+def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
+                  batch_size=256, lr=1e-4, value_weight=1.0,
+                  human_data_dir=None, human_mix_ratio=0.5,
+                  freeze_value=False, differential_lr=False,
+                  label_smoothing=0.0, scheduler='cosine',
+                  body_dims=None, dropout=0.0):
+    """Train AlphaZero network on self-play data, optionally mixed with human data.
 
     Args:
         checkpoint_path: Path to current checkpoint (for architecture + normalization)
         data_dirs: List of data directories to load
         output_path: Where to save the trained checkpoint
-        epochs: Number of training epochs
+        epochs: Number of training epochs (default 5 — nudge, don't memorize)
         batch_size: Batch size
-        lr: Learning rate
+        lr: Learning rate (default 1e-4 — conservative to preserve warm-start)
         value_weight: Weight of value loss vs policy loss
+        human_data_dir: Path to parquet directory with human BC data.
+            When set, human samples are mixed in at human_mix_ratio.
+        human_mix_ratio: Fraction of training data that is human (default 0.5).
+            Human samples contribute only value loss (no policy targets).
+        freeze_value: If True, freeze value head (train policy only).
+            Use for early iterations where the warm-start value head is
+            better than what self-play can teach.
+        differential_lr: If True, use per-group learning rates:
+            body/value at lr*0.1, policy at lr*10. Protects warm-started
+            weights while letting the cold-started policy head learn fast.
+        label_smoothing: Smoothing factor for one-hot policy targets (0.0-1.0).
+            Smoothed target = (1-ε)*target + ε/num_classes. Prevents
+            overconfident logits and reduces overfitting on ExIt data.
+        scheduler: LR scheduler type. 'cosine' (default) or 'constant'.
+        body_dims: Tuple of body layer dimensions (e.g., (512, 256)).
+            When specified, creates a fresh network with this architecture
+            instead of loading weights from the checkpoint. The checkpoint
+            is only used for feature normalization metadata.
+        dropout: Dropout rate in body layers (default 0.0). Only used
+            when body_dims is specified.
 
     Returns:
         training stats dict
     """
-    net, ckpt = load_checkpoint(checkpoint_path)
-    net.train()
+    # Pick best available device
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
 
+    # Load metadata from checkpoint
+    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    if body_dims is not None:
+        # Create fresh network with new architecture
+        net = CatanAlphaZeroNet(
+            input_dim=ckpt.get('input_dim', 176),
+            num_actions=ckpt.get('num_actions', ACTION_SPACE_SIZE),
+            body_dims=tuple(body_dims),
+            dropout=dropout,
+            shared_body=True,
+        )
+        total_params = sum(p.numel() for p in net.parameters())
+        print(f"  Fresh network: body_dims={tuple(body_dims)}, dropout={dropout}, "
+              f"shared_body=True, {total_params:,} params")
+    else:
+        net, _ = load_checkpoint(checkpoint_path)
+
+    net.to(device)
+    net.train()
+    print(f"  Training on device: {device}")
+
+    feat_names = ckpt['feature_names']
     feat_means = ckpt['feature_means']
     feat_stds = ckpt['feature_stds']
-    iteration = ckpt.get('iteration', 0) + 1
+    iteration = 1 if body_dims is not None else ckpt.get('iteration', 0) + 1
 
-    # Load all data
+    # Load self-play data
     all_features = []
     all_policies = []
     all_values = []
@@ -602,45 +1200,137 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=20,
         all_policies.append(p)
         all_values.append(v)
 
-    features = np.concatenate(all_features)
-    policies = np.concatenate(all_policies)
-    values = np.concatenate(all_values)
+    sp_features = np.concatenate(all_features)
+    sp_policies = np.concatenate(all_policies)
+    sp_values = np.concatenate(all_values)
+    n_sp = len(sp_values)
 
-    print(f"Training on {len(values)} samples from {len(data_dirs)} data dir(s)")
-    print(f"  Value distribution: mean={values.mean():.3f}, std={values.std():.3f}")
+    print(f"Self-play data: {n_sp} samples from {len(data_dirs)} dir(s)")
+    print(f"  Value distribution: mean={sp_values.mean():.3f}, std={sp_values.std():.3f}")
 
+    # Optionally mix in human data
+    if human_data_dir is not None and human_mix_ratio > 0:
+        # Match human sample count to achieve desired ratio
+        n_human = int(n_sp * human_mix_ratio / (1 - human_mix_ratio))
+        h_feat, h_pol, h_val = _load_human_data(
+            human_data_dir, list(feat_names), max_samples=n_human)
+
+        features = np.concatenate([sp_features, h_feat])
+        policies = np.concatenate([sp_policies, h_pol])
+        values = np.concatenate([sp_values, h_val])
+        print(f"Mixed training: {n_sp} self-play + {len(h_val)} human "
+              f"= {len(values)} total ({len(h_val)/len(values)*100:.0f}% human)")
+    else:
+        features = sp_features
+        policies = sp_policies
+        values = sp_values
+
+    # Preload entire dataset as tensors on device (skip per-batch transfers)
     dataset = SelfPlayDataset(features, policies, values, feat_means, feat_stds)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
 
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # Train/val split (90/10)
+    n_total = len(dataset)
+    n_val = max(1, int(n_total * 0.1))
+    n_train = n_total - n_val
+    perm_split = torch.randperm(n_total)
+    train_idx = perm_split[:n_train]
+    val_idx = perm_split[n_train:]
+
+    train_feat = dataset.features[train_idx].to(device)
+    train_pol = dataset.policies[train_idx].to(device)
+    train_val = dataset.values[train_idx].to(device)
+    val_feat = dataset.features[val_idx].to(device)
+    val_pol = dataset.policies[val_idx].to(device)
+    val_val = dataset.values[val_idx].to(device)
+    n_samples = n_train
+    print(f"  Preloaded {n_train} train + {n_val} val samples to {device}")
+
+    # Freeze value path — what gets frozen depends on shared vs split body
+    if freeze_value:
+        if net.shared_body:
+            # Shared body: freeze only value_head (body is shared, can't freeze it)
+            for param in net.value_head.parameters():
+                param.requires_grad = False
+            trainable = [p for p in net.parameters() if p.requires_grad]
+            print(f"  Value head FROZEN (shared body stays trainable) "
+                  f"({sum(p.numel() for p in trainable)} trainable params)")
+        else:
+            # Split body: freeze value_body + value_head
+            for param in net.value_body.parameters():
+                param.requires_grad = False
+            for param in net.value_head.parameters():
+                param.requires_grad = False
+            trainable = [p for p in net.parameters() if p.requires_grad]
+            print(f"  Value path FROZEN — training policy_body + policy_head only "
+                  f"({sum(p.numel() for p in trainable)} params)")
+
+    if differential_lr and not freeze_value:
+        # Protect warm-started value path, let policy path learn fast
+        if net.shared_body:
+            param_groups = [
+                {'params': list(net.body.parameters()), 'lr': lr * 0.1},
+                {'params': list(net.value_head.parameters()), 'lr': lr * 0.1},
+                {'params': list(net.policy_head.parameters()), 'lr': lr * 10},
+            ]
+        else:
+            param_groups = [
+                {'params': list(net.value_body.parameters()), 'lr': lr * 0.1},
+                {'params': list(net.value_head.parameters()), 'lr': lr * 0.1},
+                {'params': list(net.policy_body.parameters()), 'lr': lr * 10},
+                {'params': list(net.policy_head.parameters()), 'lr': lr * 10},
+            ]
+        optimizer = torch.optim.Adam(param_groups, weight_decay=1e-4)
+        print(f"  Differential LR: value={lr*0.1:.1e}, policy={lr*10:.1e}")
+    elif freeze_value:
+        optimizer = torch.optim.Adam(trainable, lr=lr, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
+    if scheduler == 'cosine':
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    else:
+        lr_scheduler = None  # constant LR
+
+    if label_smoothing > 0:
+        print(f"  Label smoothing: {label_smoothing}")
+
+    def _compute_loss(feat_b, pol_b, val_b):
+        """Compute combined loss on a batch."""
+        v_pred, logits = net(feat_b)
+        v_pred = v_pred.squeeze(-1)
+        v_loss = F.mse_loss(v_pred, val_b)
+        has_policy = pol_b.sum(dim=-1) > 0
+        if has_policy.any():
+            sp_logits = logits[has_policy]
+            sp_policy = pol_b[has_policy]
+            if label_smoothing > 0:
+                n_classes = sp_policy.shape[-1]
+                sp_policy = (1 - label_smoothing) * sp_policy + label_smoothing / n_classes
+            log_probs = F.log_softmax(sp_logits, dim=-1).clamp(min=-100.0)
+            p_loss = -(sp_policy * log_probs).sum(dim=-1).mean()
+        else:
+            p_loss = torch.tensor(0.0, device=feat_b.device)
+        return value_weight * v_loss + p_loss, v_loss, p_loss
+
+    # Early stopping state
+    best_val_loss = float('inf')
+    best_state_dict = None
+    patience = 20
+    patience_counter = 0
 
     history = []
     for epoch in range(epochs):
+        net.train()
         total_loss = 0.0
         total_v_loss = 0.0
         total_p_loss = 0.0
         n_batches = 0
 
-        for feat_batch, policy_batch, value_batch in loader:
-            # Build action mask from policy targets (nonzero = legal)
-            action_mask = policy_batch > 0
-
-            # Forward
-            value_pred, logits = net(feat_batch, action_mask)
-            value_pred = value_pred.squeeze(-1)
-
-            # Value loss: MSE
-            v_loss = F.mse_loss(value_pred, value_batch)
-
-            # Policy loss: cross-entropy with visit distribution
-            # Only compute over legal actions (nonzero targets) to avoid 0 * -inf = nan
-            log_probs = F.log_softmax(logits, dim=-1)
-            # Clamp log_probs to avoid -inf * 0 producing nan
-            log_probs = log_probs.clamp(min=-100.0)
-            p_loss = -(policy_batch * log_probs).sum(dim=-1).mean()
-
-            loss = value_weight * v_loss + p_loss
+        # Shuffle training indices each epoch
+        perm = torch.randperm(n_samples, device=device)
+        for start in range(0, n_samples, batch_size):
+            idx = perm[start:start + batch_size]
+            loss, v_loss, p_loss = _compute_loss(
+                train_feat[idx], train_pol[idx], train_val[idx])
 
             optimizer.zero_grad()
             loss.backward()
@@ -651,22 +1341,66 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=20,
             total_p_loss += p_loss.item()
             n_batches += 1
 
-        scheduler.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         avg_loss = total_loss / n_batches
         avg_v = total_v_loss / n_batches
         avg_p = total_p_loss / n_batches
-        history.append({'epoch': epoch, 'loss': avg_loss, 'v_loss': avg_v, 'p_loss': avg_p})
 
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        # Validation loss
+        net.eval()
+        with torch.no_grad():
+            val_loss, val_v, val_p = _compute_loss(val_feat, val_pol, val_val)
+            val_loss_val = val_loss.item()
+            val_v_val = val_v.item()
+            val_p_val = val_p.item()
+
+        history.append({
+            'epoch': epoch, 'loss': avg_loss, 'v_loss': avg_v, 'p_loss': avg_p,
+            'val_loss': val_loss_val, 'val_v_loss': val_v_val, 'val_p_loss': val_p_val,
+        })
+
+        if (epoch + 1) % 2 == 0 or epoch == 0:
             print(f"  Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} "
-                  f"(v={avg_v:.4f}, p={avg_p:.4f})")
+                  f"(v={avg_v:.4f}, p={avg_p:.4f}) | "
+                  f"val={val_loss_val:.4f} (v={val_v_val:.4f}, p={val_p_val:.4f})")
 
-    net.eval()
+        # Early stopping check
+        if val_loss_val < best_val_loss:
+            best_val_loss = val_loss_val
+            best_state_dict = {k: v.clone() for k, v in net.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  Early stopping at epoch {epoch+1} "
+                      f"(val loss {val_loss_val:.4f} vs best {best_val_loss:.4f})")
+                break
+
+    # Restore best model
+    if best_state_dict is not None:
+        net.load_state_dict(best_state_dict)
+        best_epoch = min(history, key=lambda h: h.get('val_loss', float('inf')))
+        print(f"  Restored best model from epoch {best_epoch['epoch']+1} "
+              f"(val_loss={best_val_loss:.4f})")
+
+    # Unfreeze value path before saving (so it's trainable in next iteration)
+    if freeze_value:
+        if not net.shared_body:
+            for param in net.value_body.parameters():
+                param.requires_grad = True
+        for param in net.value_head.parameters():
+            param.requires_grad = True
+
+    net.to('cpu').eval()
     save_checkpoint(
         net, optimizer, iteration,
-        ckpt['feature_names'], feat_means, feat_stds,
+        feat_names, feat_means, feat_stds,
         output_path,
-        extra={'training_history': history, 'num_samples': len(values)},
+        extra={'training_history': history, 'num_samples': len(values),
+               'freeze_value': freeze_value, 'differential_lr': differential_lr,
+               'human_samples': len(values) - n_sp if human_data_dir else 0,
+               'best_val_loss': best_val_loss},
     )
     print(f"Saved trained checkpoint to {output_path} (iteration {iteration})")
 
@@ -677,71 +1411,158 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=20,
 # Evaluation
 # ---------------------------------------------------------------------------
 
+_eval_worker_new_net = None
+_eval_worker_old_net = None
+_eval_worker_fi_map = None
+_eval_worker_means = None
+_eval_worker_stds = None
+_eval_worker_sims = None
+_eval_worker_c_puct = None
+
+
+def _eval_worker_init(new_path, old_path, num_simulations, c_puct):
+    """Initialize per-worker state for evaluation."""
+    global _eval_worker_new_net, _eval_worker_old_net
+    global _eval_worker_fi_map, _eval_worker_means, _eval_worker_stds
+    global _eval_worker_sims, _eval_worker_c_puct
+
+    new_net, new_ckpt = load_checkpoint(new_path)
+    old_net, _ = load_checkpoint(old_path)
+
+    feat_names = new_ckpt['feature_names']
+    _eval_worker_means = new_ckpt['feature_means']
+    _eval_worker_stds = new_ckpt['feature_stds']
+    _eval_worker_fi_map = {name: i for i, name in enumerate(feat_names)}
+    _eval_worker_new_net = new_net
+    _eval_worker_old_net = old_net
+    _eval_worker_sims = num_simulations
+    _eval_worker_c_puct = c_puct
+
+
+def _eval_worker_play_one(game_idx):
+    """Play one evaluation game. Returns 1 if new wins, 0 otherwise."""
+    from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
+    catan_map = build_map(BASE_MAP_TEMPLATE)
+    fi = FeatureIndexer(_eval_worker_fi_map, catan_map)
+
+    if game_idx % 2 == 0:
+        p_new = BBMCTSPlayer(
+            Color.RED, _eval_worker_new_net, fi,
+            _eval_worker_means, _eval_worker_stds,
+            num_simulations=_eval_worker_sims, c_puct=_eval_worker_c_puct,
+            temperature=0.0, dirichlet_alpha=0.0,
+        )
+        p_old = BBMCTSPlayer(
+            Color.BLUE, _eval_worker_old_net, fi,
+            _eval_worker_means, _eval_worker_stds,
+            num_simulations=_eval_worker_sims, c_puct=_eval_worker_c_puct,
+            temperature=0.0, dirichlet_alpha=0.0,
+        )
+        new_color = Color.RED
+    else:
+        p_new = BBMCTSPlayer(
+            Color.BLUE, _eval_worker_new_net, fi,
+            _eval_worker_means, _eval_worker_stds,
+            num_simulations=_eval_worker_sims, c_puct=_eval_worker_c_puct,
+            temperature=0.0, dirichlet_alpha=0.0,
+        )
+        p_old = BBMCTSPlayer(
+            Color.RED, _eval_worker_old_net, fi,
+            _eval_worker_means, _eval_worker_stds,
+            num_simulations=_eval_worker_sims, c_puct=_eval_worker_c_puct,
+            temperature=0.0, dirichlet_alpha=0.0,
+        )
+        new_color = Color.BLUE
+
+    game = Game(players=[p_new, p_old] if new_color == Color.RED
+                else [p_old, p_new], vps_to_win=10)
+    fi.update_map(game.state.board.map)
+
+    turns = 0
+    while game.winning_color() is None and turns < 1000:
+        actions = game.playable_actions
+        current = game.state.current_player()
+        action = current.decide(game, actions)
+        game.execute(action)
+        turns += 1
+
+    return 1 if game.winning_color() == new_color else 0
+
+
 def evaluate_checkpoints(new_path, old_path, num_games=200,
-                         num_simulations=400, c_puct=1.4):
+                         num_simulations=400, c_puct=1.4, workers=1):
     """Evaluate new checkpoint vs old checkpoint.
 
     Both play as MCTS with their respective networks. New plays as both
     colors (half the games each). Returns win rate of new.
     """
-    new_net, new_ckpt = load_checkpoint(new_path)
-    old_net, old_ckpt = load_checkpoint(old_path)
+    if workers > 1:
+        print(f"  Using {workers} parallel workers for evaluation")
+        with mp.Pool(
+            processes=workers,
+            initializer=_eval_worker_init,
+            initargs=(new_path, old_path, num_simulations, c_puct),
+        ) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(_eval_worker_play_one, range(num_games)),
+                total=num_games, desc="Evaluating",
+            ))
+        new_wins = sum(results)
+    else:
+        new_net, new_ckpt = load_checkpoint(new_path)
+        old_net, _ = load_checkpoint(old_path)
 
-    # Use new checkpoint's normalization (should be same)
-    feat_names = new_ckpt['feature_names']
-    feat_means = new_ckpt['feature_means']
-    feat_stds = new_ckpt['feature_stds']
-    feature_index_map = {name: i for i, name in enumerate(feat_names)}
+        feat_names = new_ckpt['feature_names']
+        feat_means = new_ckpt['feature_means']
+        feat_stds = new_ckpt['feature_stds']
+        feature_index_map = {name: i for i, name in enumerate(feat_names)}
 
-    from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
-    catan_map = build_map(BASE_MAP_TEMPLATE)
-    fi = FeatureIndexer(feature_index_map, catan_map)
+        from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
+        catan_map = build_map(BASE_MAP_TEMPLATE)
 
-    new_wins = 0
-    for i in tqdm(range(num_games), desc="Evaluating"):
-        fi_copy = FeatureIndexer(feature_index_map, catan_map)
+        new_wins = 0
+        for i in tqdm(range(num_games), desc="Evaluating"):
+            fi_copy = FeatureIndexer(feature_index_map, catan_map)
 
-        if i % 2 == 0:
-            # New plays RED
-            p_new = BBMCTSPlayer(
-                Color.RED, new_net, fi_copy, feat_means, feat_stds,
-                num_simulations=num_simulations, c_puct=c_puct,
-                temperature=0.0, dirichlet_alpha=0.0,
-            )
-            p_old = BBMCTSPlayer(
-                Color.BLUE, old_net, fi_copy, feat_means, feat_stds,
-                num_simulations=num_simulations, c_puct=c_puct,
-                temperature=0.0, dirichlet_alpha=0.0,
-            )
-            new_color = Color.RED
-        else:
-            # New plays BLUE
-            p_new = BBMCTSPlayer(
-                Color.BLUE, new_net, fi_copy, feat_means, feat_stds,
-                num_simulations=num_simulations, c_puct=c_puct,
-                temperature=0.0, dirichlet_alpha=0.0,
-            )
-            p_old = BBMCTSPlayer(
-                Color.RED, old_net, fi_copy, feat_means, feat_stds,
-                num_simulations=num_simulations, c_puct=c_puct,
-                temperature=0.0, dirichlet_alpha=0.0,
-            )
-            new_color = Color.BLUE
+            if i % 2 == 0:
+                p_new = BBMCTSPlayer(
+                    Color.RED, new_net, fi_copy, feat_means, feat_stds,
+                    num_simulations=num_simulations, c_puct=c_puct,
+                    temperature=0.0, dirichlet_alpha=0.0,
+                )
+                p_old = BBMCTSPlayer(
+                    Color.BLUE, old_net, fi_copy, feat_means, feat_stds,
+                    num_simulations=num_simulations, c_puct=c_puct,
+                    temperature=0.0, dirichlet_alpha=0.0,
+                )
+                new_color = Color.RED
+            else:
+                p_new = BBMCTSPlayer(
+                    Color.BLUE, new_net, fi_copy, feat_means, feat_stds,
+                    num_simulations=num_simulations, c_puct=c_puct,
+                    temperature=0.0, dirichlet_alpha=0.0,
+                )
+                p_old = BBMCTSPlayer(
+                    Color.RED, old_net, fi_copy, feat_means, feat_stds,
+                    num_simulations=num_simulations, c_puct=c_puct,
+                    temperature=0.0, dirichlet_alpha=0.0,
+                )
+                new_color = Color.BLUE
 
-        game = Game(players=[p_new, p_old] if new_color == Color.RED
-                    else [p_old, p_new], vps_to_win=10)
-        fi_copy.update_map(game.state.board.map)
+            game = Game(players=[p_new, p_old] if new_color == Color.RED
+                        else [p_old, p_new], vps_to_win=10)
+            fi_copy.update_map(game.state.board.map)
 
-        turns = 0
-        while game.winning_color() is None and turns < 1000:
-            actions = game.playable_actions
-            current = game.state.current_player()
-            action = current.decide(game, actions)
-            game.execute(action)
-            turns += 1
+            turns = 0
+            while game.winning_color() is None and turns < 1000:
+                actions = game.playable_actions
+                current = game.state.current_player()
+                action = current.decide(game, actions)
+                game.execute(action)
+                turns += 1
 
-        if game.winning_color() == new_color:
-            new_wins += 1
+            if game.winning_color() == new_color:
+                new_wins += 1
 
     win_rate = new_wins / num_games
     ci = 1.96 * (win_rate * (1 - win_rate) / num_games) ** 0.5
@@ -774,8 +1595,12 @@ def _save_loop_state(output_dir, state):
 
 
 def run_loop(start_checkpoint, iterations, games_per_iter, num_simulations,
-             output_dir, c_puct=1.4, epochs=20, batch_size=256, lr=1e-3,
-             eval_games=100, accept_threshold=0.55, window_size=5, workers=1):
+             output_dir, c_puct=1.4, epochs=5, batch_size=256, lr=1e-4,
+             eval_games=100, accept_threshold=0.55, window_size=5, workers=1,
+             blend_bootstrap_path=None, human_data_dir=None,
+             human_mix_ratio=0.5, freeze_value=False, accept_all=False,
+             expert=False, bc_model=None, search_depth=2, dice_sample_size=5,
+             differential_lr=False, label_smoothing=0.0, scheduler='cosine'):
     """Run the full AlphaZero training loop. Fully resumable.
 
     State is persisted to output_dir/_loop_state.json after each step.
@@ -790,7 +1615,26 @@ def run_loop(start_checkpoint, iterations, games_per_iter, num_simulations,
     2. Train new network on recent self-play data
     3. Evaluate new vs current best
     4. Accept if win rate > threshold
+
+    Args:
+        blend_bootstrap_path: Path to BC value net for iteration 1 bootstrap.
+            When set, iteration 1 self-play uses the BC neural net as MCTS
+            leaf evaluator. Iterations 2+ use the trained AZ network.
+        human_data_dir: Path to parquet dir with human BC data for mixing.
+        human_mix_ratio: Fraction of training data that is human (default 0.5).
+        freeze_value: If True, freeze value head during training.
+        expert: If True, use Expert Iteration (BitboardSearchPlayer) for
+            data generation instead of MCTS self-play. Auto-sets accept_all
+            since rejection doesn't make sense (expert quality is fixed).
+        bc_model: Path to BC value net for expert search player blend.
+            Required when expert=True.
+        search_depth: Search depth for expert player (default 2).
+        dice_sample_size: Dice outcomes for expert player (default 5).
+        differential_lr: If True, use differential learning rates.
     """
+    if expert:
+        accept_all = True  # Expert data quality is fixed; rejection is meaningless
+
     os.makedirs(output_dir, exist_ok=True)
 
     # Load or initialize loop state
@@ -822,12 +1666,28 @@ def run_loop(start_checkpoint, iterations, games_per_iter, num_simulations,
 
         # --- Phase 1: Generate ---
         if phase == 'generate':
-            print(f"\n[1/3] Generating {games_per_iter} self-play games...")
-            records, stats = generate_games(
-                current_best, games_per_iter,
-                num_simulations=num_simulations, c_puct=c_puct,
-                output_dir=iter_data_dir, workers=workers,
-            )
+            if expert:
+                print(f"\n[1/3] Generating {games_per_iter} expert games "
+                      f"(search depth={search_depth}, dice_sample={dice_sample_size})...")
+                records, stats = generate_expert_games(
+                    bc_model, games_per_iter,
+                    search_depth=search_depth, dice_sample_size=dice_sample_size,
+                    output_dir=iter_data_dir, workers=workers,
+                )
+            else:
+                # Blend bootstrap only for iteration 1
+                iter_bootstrap = blend_bootstrap_path if it == 1 else None
+                if iter_bootstrap:
+                    print(f"\n[1/3] Generating {games_per_iter} self-play games "
+                          f"(blend bootstrap from {iter_bootstrap})...")
+                else:
+                    print(f"\n[1/3] Generating {games_per_iter} self-play games...")
+                records, stats = generate_games(
+                    current_best, games_per_iter,
+                    num_simulations=num_simulations, c_puct=c_puct,
+                    output_dir=iter_data_dir, workers=workers,
+                    blend_bootstrap_path=iter_bootstrap,
+                )
             # Final save with summary
             save_records(records, iter_data_dir)
             print(f"  Stats: {stats}")
@@ -852,6 +1712,12 @@ def run_loop(start_checkpoint, iterations, games_per_iter, num_simulations,
             train_stats = train_on_data(
                 current_best, data_dirs, new_ckpt_path,
                 epochs=epochs, batch_size=batch_size, lr=lr,
+                human_data_dir=human_data_dir,
+                human_mix_ratio=human_mix_ratio,
+                freeze_value=freeze_value,
+                differential_lr=differential_lr,
+                label_smoothing=label_smoothing,
+                scheduler=scheduler,
             )
 
             phase = 'evaluate'
@@ -865,18 +1731,24 @@ def run_loop(start_checkpoint, iterations, games_per_iter, num_simulations,
 
         # --- Phase 3: Evaluate ---
         if phase == 'evaluate':
-            print(f"\n[3/3] Evaluating new vs current best ({eval_games} games)...")
-            win_rate, ci = evaluate_checkpoints(
-                new_ckpt_path, current_best,
-                num_games=eval_games, num_simulations=num_simulations,
-                c_puct=c_puct,
-            )
-
-            if win_rate >= accept_threshold:
-                print(f"  ACCEPTED (win rate {win_rate*100:.1f}% >= {accept_threshold*100:.0f}%)")
+            if accept_all:
+                print(f"\n[3/3] Auto-accepting (--accept-all)")
+                win_rate, ci = 1.0, 0.0
                 current_best = new_ckpt_path
+                print(f"  ACCEPTED (always-accept mode)")
             else:
-                print(f"  REJECTED (win rate {win_rate*100:.1f}% < {accept_threshold*100:.0f}%)")
+                print(f"\n[3/3] Evaluating new vs current best ({eval_games} games)...")
+                win_rate, ci = evaluate_checkpoints(
+                    new_ckpt_path, current_best,
+                    num_games=eval_games, num_simulations=num_simulations,
+                    c_puct=c_puct, workers=workers,
+                )
+
+                if win_rate >= accept_threshold:
+                    print(f"  ACCEPTED (win rate {win_rate*100:.1f}% >= {accept_threshold*100:.0f}%)")
+                    current_best = new_ckpt_path
+                else:
+                    print(f"  REJECTED (win rate {win_rate*100:.1f}% < {accept_threshold*100:.0f}%)")
 
             # Save iteration metadata
             meta_path = os.path.join(output_dir, f"iter{it}_meta.json")
@@ -921,16 +1793,56 @@ def main():
     gen_parser.add_argument('--output-dir', required=True)
     gen_parser.add_argument('--workers', type=int, default=1,
                             help='Parallel worker processes (default: 1)')
+    gen_parser.add_argument('--blend-bootstrap', default=None, metavar='PATH',
+                            help='Path to BC value net (e.g., value_net_v2.pt) for '
+                                 'leaf evaluation bootstrap. Uses BC neural net instead '
+                                 'of AZ network for MCTS value estimation.')
 
     # Train
     train_parser = subparsers.add_parser('train', help='Train on self-play data')
     train_parser.add_argument('--checkpoint', required=True)
     train_parser.add_argument('--data-dir', nargs='+', required=True)
     train_parser.add_argument('--output', required=True)
-    train_parser.add_argument('--epochs', type=int, default=20)
+    train_parser.add_argument('--epochs', type=int, default=5)
     train_parser.add_argument('--batch-size', type=int, default=256)
-    train_parser.add_argument('--lr', type=float, default=1e-3)
+    train_parser.add_argument('--lr', type=float, default=1e-4)
     train_parser.add_argument('--value-weight', type=float, default=1.0)
+    train_parser.add_argument('--human-data', default=None, metavar='PATH',
+                              help='Parquet dir with human BC data to mix in')
+    train_parser.add_argument('--human-mix-ratio', type=float, default=0.5,
+                              help='Fraction of training data from human games (default 0.5)')
+    train_parser.add_argument('--freeze-value', action='store_true',
+                              help='Freeze value head (train body + policy only)')
+    train_parser.add_argument('--differential-lr', action='store_true',
+                              help='Use differential LR: body/value at lr*0.1, '
+                                   'policy at lr*10 (protects warm-start)')
+    train_parser.add_argument('--label-smoothing', type=float, default=0.0,
+                              help='Label smoothing for policy targets (default 0.0)')
+    train_parser.add_argument('--scheduler', choices=['cosine', 'constant'],
+                              default='cosine', help='LR scheduler (default: cosine)')
+    train_parser.add_argument('--body-dims', default=None,
+                              help='Body layer dimensions as comma-separated ints '
+                                   '(e.g., "512,256"). Creates a fresh network instead '
+                                   'of loading weights from checkpoint.')
+    train_parser.add_argument('--dropout', type=float, default=0.0,
+                              help='Dropout rate in body layers (default 0.0). '
+                                   'Only used with --body-dims.')
+
+    # Expert iteration data generation
+    expert_parser = subparsers.add_parser('expert',
+                                          help='Generate expert iteration data')
+    expert_parser.add_argument('--bc-model', required=True,
+                               help='BC value net (e.g., value_net_v2.pt) for blend')
+    expert_parser.add_argument('--games', type=int, default=1000)
+    expert_parser.add_argument('--search-depth', type=int, default=2)
+    expert_parser.add_argument('--dice-sample', type=int, default=5)
+    expert_parser.add_argument('--output-dir', required=True)
+    expert_parser.add_argument('--workers', type=int, default=1,
+                               help='Parallel worker processes (default: 1)')
+    expert_parser.add_argument('--distill-values', action='store_true',
+                               help='Record blend function evaluation as value target '
+                                    'instead of binary game outcome. Produces continuous '
+                                    'value targets in [-1, +1] for knowledge distillation.')
 
     # Evaluate
     eval_parser = subparsers.add_parser('evaluate', help='Evaluate new vs old')
@@ -938,6 +1850,8 @@ def main():
     eval_parser.add_argument('--old-checkpoint', required=True)
     eval_parser.add_argument('--games', type=int, default=200)
     eval_parser.add_argument('--sims', type=int, default=400)
+    eval_parser.add_argument('--workers', type=int, default=1,
+                             help='Parallel worker processes (default: 1)')
 
     # Full loop
     loop_parser = subparsers.add_parser('loop', help='Full training loop')
@@ -946,10 +1860,43 @@ def main():
     loop_parser.add_argument('--games-per-iter', type=int, default=500)
     loop_parser.add_argument('--sims', type=int, default=400)
     loop_parser.add_argument('--output-dir', required=True)
-    loop_parser.add_argument('--epochs', type=int, default=20)
+    loop_parser.add_argument('--epochs', type=int, default=5)
+    loop_parser.add_argument('--lr', type=float, default=1e-4,
+                             help='Learning rate (default 1e-4)')
     loop_parser.add_argument('--eval-games', type=int, default=100)
     loop_parser.add_argument('--workers', type=int, default=1,
                              help='Parallel worker processes (default: 1)')
+    loop_parser.add_argument('--blend-bootstrap', default=None, metavar='PATH',
+                             help='Path to BC value net for iteration 1 bootstrap. '
+                                  'Uses BC neural net as MCTS leaf evaluator for the '
+                                  'first iteration only; subsequent iterations use the '
+                                  'trained AZ network.')
+    loop_parser.add_argument('--human-data', default=None, metavar='PATH',
+                             help='Parquet dir with human BC data to mix in during training')
+    loop_parser.add_argument('--human-mix-ratio', type=float, default=0.5,
+                             help='Fraction of training data from human games (default 0.5)')
+    loop_parser.add_argument('--freeze-value', action='store_true',
+                             help='Freeze value head (train body + policy only)')
+    loop_parser.add_argument('--accept-all', action='store_true',
+                             help='Always accept new model (skip evaluation). '
+                                  'Follows AlphaZero approach of always using latest model.')
+    loop_parser.add_argument('--expert', action='store_true',
+                             help='Use Expert Iteration: generate data with '
+                                  'BitboardSearchPlayer instead of MCTS self-play')
+    loop_parser.add_argument('--bc-model', default=None, metavar='PATH',
+                             help='BC value net for expert search player blend '
+                                  '(required with --expert)')
+    loop_parser.add_argument('--search-depth', type=int, default=2,
+                             help='Search depth for expert player (default 2)')
+    loop_parser.add_argument('--dice-sample', type=int, default=5,
+                             help='Dice outcomes for expert player (default 5)')
+    loop_parser.add_argument('--differential-lr', action='store_true',
+                             help='Use differential LR: body/value at lr*0.1, '
+                                  'policy at lr*10 (protects warm-start)')
+    loop_parser.add_argument('--label-smoothing', type=float, default=0.0,
+                             help='Label smoothing for policy targets (default 0.0)')
+    loop_parser.add_argument('--scheduler', choices=['cosine', 'constant'],
+                             default='cosine', help='LR scheduler (default: cosine)')
 
     args = parser.parse_args()
 
@@ -967,30 +1914,69 @@ def main():
             num_simulations=args.sims, c_puct=args.c_puct,
             output_dir=args.output_dir,
             workers=args.workers,
+            blend_bootstrap_path=args.blend_bootstrap,
+        )
+        save_records(records, args.output_dir)
+        print(f"Stats: {stats}")
+
+    elif args.command == 'expert':
+        records, stats = generate_expert_games(
+            args.bc_model, args.games,
+            search_depth=args.search_depth,
+            dice_sample_size=args.dice_sample,
+            output_dir=args.output_dir,
+            workers=args.workers,
+            distill_values=args.distill_values,
         )
         save_records(records, args.output_dir)
         print(f"Stats: {stats}")
 
     elif args.command == 'train':
+        body_dims = None
+        if args.body_dims:
+            body_dims = tuple(int(x) for x in args.body_dims.split(','))
         train_on_data(
             args.checkpoint, args.data_dir, args.output,
             epochs=args.epochs, batch_size=args.batch_size,
             lr=args.lr, value_weight=args.value_weight,
+            human_data_dir=args.human_data,
+            human_mix_ratio=args.human_mix_ratio,
+            freeze_value=args.freeze_value,
+            differential_lr=args.differential_lr,
+            label_smoothing=args.label_smoothing,
+            scheduler=args.scheduler,
+            body_dims=body_dims, dropout=args.dropout,
         )
 
     elif args.command == 'evaluate':
         evaluate_checkpoints(
             args.new_checkpoint, args.old_checkpoint,
             num_games=args.games, num_simulations=args.sims,
+            workers=args.workers,
         )
 
     elif args.command == 'loop':
+        if args.expert and not args.bc_model:
+            parser.error("--expert requires --bc-model")
         run_loop(
             args.start_checkpoint, args.iterations,
             args.games_per_iter, args.sims,
             args.output_dir,
-            epochs=args.epochs, eval_games=args.eval_games,
+            epochs=args.epochs, lr=args.lr,
+            eval_games=args.eval_games,
             workers=args.workers,
+            blend_bootstrap_path=args.blend_bootstrap,
+            human_data_dir=args.human_data,
+            human_mix_ratio=args.human_mix_ratio,
+            freeze_value=args.freeze_value,
+            accept_all=args.accept_all,
+            expert=args.expert,
+            bc_model=args.bc_model,
+            search_depth=args.search_depth,
+            dice_sample_size=args.dice_sample,
+            differential_lr=args.differential_lr,
+            label_smoothing=args.label_smoothing,
+            scheduler=args.scheduler,
         )
 
     else:

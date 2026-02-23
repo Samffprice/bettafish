@@ -78,12 +78,14 @@ class BridgeServer:
 
     def __init__(self, bot_type: str = "value", anticheat: bool = None,
                  search_depth: int = 2, blend_weight: float = 1e8,
-                 bc_model_path: str = "robottler/models/value_net_v2.pt"):
+                 bc_model_path: str = "robottler/models/value_net_v2.pt",
+                 trade_strategy: str = "blend"):
         self.translator = StateTranslator()
         self.action_translator: Optional[ActionTranslator] = None
         self.bot = BotInterface(
             bot_type=bot_type, search_depth=search_depth,
             blend_weight=blend_weight, bc_model_path=bc_model_path,
+            trade_strategy=trade_strategy,
         )
         self.game_logger = GameLogger()
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -1373,11 +1375,27 @@ class BridgeServer:
         offered = offer_data.get("offeredResources", [])
         wanted = offer_data.get("wantedResources", [])
 
+        # Reconstruct game for smart trade evaluation
+        game = self.translator.reconstruct_game()
+        our_color = self.translator.state.my_catan_color
+        creator_vps = 0
+        vps_to_win = 10
+        if game is not None:
+            vps_to_win = game.vps_to_win
+            creator_catan = self.translator.state.colonist_to_catan_color.get(creator)
+            if creator_catan is not None and creator_catan in game.state.color_to_index:
+                c_idx = game.state.color_to_index[creator_catan]
+                creator_vps = game.state.player_state.get(
+                    f"P{c_idx}_ACTUAL_VICTORY_POINTS", 0)
+
         accept = self.bot.decide_trade_response(
-            offered,
-            wanted,
+            offered, wanted,
             self.translator.state.my_resources,
             trade_id,
+            game=game,
+            our_color=our_color,
+            creator_vps=creator_vps,
+            vps_to_win=vps_to_win,
         )
 
         if accept:
@@ -1557,12 +1575,13 @@ class BridgeServer:
 
 async def main(bot_type: str = "value", anticheat: bool = None,
                search_depth: int = 2, blend_weight: float = 1e8,
-               bc_model_path: str = "robottler/models/value_net_v2.pt"):
+               bc_model_path: str = "robottler/models/value_net_v2.pt",
+               trade_strategy: str = "blend"):
     """Start the bridge server."""
     server = BridgeServer(
         bot_type=bot_type, anticheat=anticheat,
         search_depth=search_depth, blend_weight=blend_weight,
-        bc_model_path=bc_model_path,
+        bc_model_path=bc_model_path, trade_strategy=trade_strategy,
     )
     async with websockets.serve(server.handle_connection, WS_HOST, WS_PORT):
         logger.info(f"Bridge server running on ws://{WS_HOST}:{WS_PORT} (bot={bot_type})")
@@ -1585,10 +1604,13 @@ if __name__ == "__main__":
                         help="Blend weight for search bot (default: 1e8)")
     parser.add_argument("--bc-model", type=str, default="robottler/models/value_net_v2.pt",
                         help="BC model path for search bot")
+    parser.add_argument("--trade-strategy", type=str, default="blend",
+                        choices=["blend", "heuristic"],
+                        help="Trade evaluation strategy (default: blend)")
     args = parser.parse_args()
     anticheat = False if args.no_anticheat else None
     asyncio.run(main(
         bot_type=args.bot, anticheat=anticheat,
         search_depth=args.search_depth, blend_weight=args.blend_weight,
-        bc_model_path=args.bc_model,
+        bc_model_path=args.bc_model, trade_strategy=args.trade_strategy,
     ))
