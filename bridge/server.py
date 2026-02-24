@@ -131,8 +131,9 @@ class BridgeServer:
         # Trade proposal (outbound) — only active when --propose-trades is set
         self._propose_trades = propose_trades
         self._pending_our_trade: bool = False
+        self._pending_our_trade_id: Optional[str] = None  # trade_id for pending proposal
         self._trade_proposal_time: float = 0.0
-        self._trade_proposed_this_turn: bool = False
+        self._trades_proposed_this_turn: int = 0
         self._first_accept_time: float = 0.0
         self._pending_trade_proposal: Optional[Dict] = None  # cached proposal for acceptee eval
 
@@ -200,6 +201,12 @@ class BridgeServer:
                     except (asyncio.CancelledError, Exception):
                         pass
             self._active_ws = None
+            # Reset ephemeral turn state on disconnect
+            self._clear_pending_trade()
+            self._trades_proposed_this_turn = 0
+            self._dice_rolled_this_turn = False
+            self._attempted_dev_play_this_turn = False
+            self._active_trade_offers.clear()
             self.game_logger.end_game()
             logger.info("Connection closed, all tasks cleaned up")
 
@@ -269,6 +276,22 @@ class BridgeServer:
         """Watchdog: auto-sends END_TURN if no action sent within watchdog timeout."""
         while True:
             await asyncio.sleep(5)
+
+            # Check for pending trade — finalize if accepted, timeout if not
+            if self._pending_our_trade:
+                elapsed = time.monotonic() - self._trade_proposal_time
+                trade_id = self._pending_our_trade_id
+                if elapsed > 5.0:
+                    if trade_id:
+                        # Try to execute if anyone accepted (safety net)
+                        logger.info("Trade proposal watchdog: checking for acceptees")
+                        await self._execute_pending_trade(trade_id)
+                    else:
+                        logger.info("Trade proposal timed out (watchdog), resuming turn")
+                        self._clear_pending_trade()
+                        if self.translator.is_our_turn():
+                            await self._safe_execute(self._handle_our_turn)
+
             if self._last_our_turn_msg_time <= 0:
                 continue
             elapsed = time.monotonic() - self._last_our_turn_msg_time
@@ -342,7 +365,25 @@ class BridgeServer:
     # ------------------------------------------------------------------
 
     async def _handle_game_init(self, msg: GameInitMsg) -> None:
-        """Handle type 4: game initialization with board, color, and player order."""
+        """Handle type 4: game initialization with board, color, and player order.
+
+        Also handles re-initialization on mid-game reconnect — clears stale
+        index maps and ephemeral state so the bot starts fresh.
+        """
+        # Clear index maps and tile data from previous init (reconnect safety)
+        self._vertex_index_to_coord.clear()
+        self._edge_index_to_coord.clear()
+        self._vertex_coord_to_idx.clear()
+        self._edge_coord_to_idx.clear()
+        self._tile_by_index.clear()
+        self._tile_by_coord.clear()
+        self._active_trade_offers.clear()
+        # Reset ephemeral turn state
+        self._clear_pending_trade()
+        self._trades_proposed_this_turn = 0
+        self._dice_rolled_this_turn = False
+        self._attempted_dev_play_this_turn = False
+
         # Set our color and player order
         self.translator.set_my_color(msg.player_color)
         self.translator.set_player_order(msg.play_order)
@@ -768,9 +809,8 @@ class BridgeServer:
                 # Not our turn — reset flags for our next turn
                 self._dice_rolled_this_turn = False
                 self._attempted_dev_play_this_turn = False
-                self._trade_proposed_this_turn = False
-                self._pending_our_trade = False
-                self._pending_trade_proposal = None
+                self._trades_proposed_this_turn = 0
+                self._clear_pending_trade()
                 # Reset road building flags on turn change
                 self.translator.state.is_road_building = False
                 self.translator.state.free_roads_available = 0
@@ -1041,7 +1081,10 @@ class BridgeServer:
                 self._active_trade_offers[trade_id] = offer_data
                 creator = offer_data.get("creator")
                 if creator == my_col_idx:
-                    continue  # We created this trade, skip
+                    # Track the trade_id for our pending proposal
+                    if self._pending_our_trade:
+                        self._pending_our_trade_id = trade_id
+                    continue  # We created this trade, skip responding
 
                 # Check if we need to respond (playerResponses has our color with 0=pending)
                 responses = offer_data.get("playerResponses", {})
@@ -1066,7 +1109,8 @@ class BridgeServer:
     async def _handle_our_trade_responses(self, trade_id: str, responses: Dict) -> None:
         """Handle responses to a trade WE proposed.
 
-        Waits ~2s after first accept for more responses, then picks best acceptee.
+        On first accept, schedules a 2s delayed finalization to wait for more
+        responses.  If all respond before the timer, finalizes immediately.
         """
         my_col_str = str(self.translator.state.my_color_index)
 
@@ -1078,33 +1122,61 @@ class BridgeServer:
             if pid != my_col_str
         )
 
-        if acceptees and self._first_accept_time == 0.0:
-            self._first_accept_time = time.monotonic()
-            logger.info(f"First accept on our trade from {acceptees}")
-
-        # Wait 2s after first accept for more responses (unless all responded)
-        if acceptees and not all_responded:
-            if time.monotonic() - self._first_accept_time < 2.0:
-                return  # Wait for more responses
-
         if not acceptees:
             if all_responded:
-                logger.info("All opponents rejected our trade")
-                self._pending_our_trade = False
-                self._pending_trade_proposal = None
+                logger.info("All opponents rejected our trade, resuming turn")
+                self._clear_pending_trade()
+                await self._safe_execute(self._handle_our_turn)
             return
 
-        # Pick the best acceptee
+        if all_responded:
+            # Everyone answered — finalize now
+            await self._execute_pending_trade(trade_id)
+            return
+
+        # First accept: schedule delayed finalization (only once)
+        if self._first_accept_time == 0.0:
+            self._first_accept_time = time.monotonic()
+            logger.info(f"First accept on our trade from {acceptees}, waiting 2s for more")
+            asyncio.ensure_future(self._delayed_trade_finalize(trade_id))
+
+    async def _delayed_trade_finalize(self, trade_id: str) -> None:
+        """Wait 2s after first accept, then execute the trade."""
+        await asyncio.sleep(2.0)
+        if not self._pending_our_trade:
+            return  # Already handled (all responded or watchdog fired)
+        logger.info("2s accept wait complete, finalizing trade")
+        await self._execute_pending_trade(trade_id)
+
+    async def _execute_pending_trade(self, trade_id: str) -> None:
+        """Pick best acceptee from current responses and execute (or cancel)."""
+        if not self._pending_our_trade:
+            return
+
+        existing = self._active_trade_offers.get(trade_id, {})
+        responses = existing.get("playerResponses", {})
+        my_col_str = str(self.translator.state.my_color_index)
+
+        acceptees = [int(pid) for pid, resp in responses.items()
+                     if pid != my_col_str and resp == TRADE_RESPONSE_ACCEPT]
+
+        if not acceptees:
+            logger.info("No acceptees, resuming turn")
+            self._clear_pending_trade()
+            await self._safe_execute(self._handle_our_turn)
+            return
+
         proposal = self._pending_trade_proposal
         if proposal is None:
-            self._pending_our_trade = False
+            self._clear_pending_trade()
+            await self._safe_execute(self._handle_our_turn)
             return
 
         game = self.translator.reconstruct_game()
         my_color = self.translator.state.my_catan_color
         if not game or not my_color:
-            self._pending_our_trade = False
-            self._pending_trade_proposal = None
+            self._clear_pending_trade()
+            await self._safe_execute(self._handle_our_turn)
             return
 
         opponent_vps = self._get_opponent_vps(game)
@@ -1128,8 +1200,15 @@ class BridgeServer:
         else:
             logger.info("No acceptable trade partner, cancelling")
 
+        self._clear_pending_trade()
+        await self._safe_execute(self._handle_our_turn)
+
+    def _clear_pending_trade(self) -> None:
+        """Clear all pending trade proposal state."""
         self._pending_our_trade = False
+        self._pending_our_trade_id = None
         self._pending_trade_proposal = None
+        self._first_accept_time = 0.0
 
     # ------------------------------------------------------------------
     # Turn handlers
@@ -1255,8 +1334,7 @@ class BridgeServer:
             elapsed = time.monotonic() - self._trade_proposal_time
             if elapsed > 5.0:
                 logger.info("Trade proposal timed out (5s), proceeding with turn")
-                self._pending_our_trade = False
-                self._pending_trade_proposal = None
+                self._clear_pending_trade()
             else:
                 return  # Still waiting for responses
 
@@ -1265,14 +1343,16 @@ class BridgeServer:
         if not my_color or not game:
             return
 
-        # Trade proposal: try once per turn, before build decisions
-        if self._propose_trades and not self._trade_proposed_this_turn:
-            self._trade_proposed_this_turn = True
+        # Trade proposal: escalating threshold, up to N per turn
+        max_proposals = self.bot._MAX_PROPOSALS_PER_TURN
+        if self._propose_trades and self._trades_proposed_this_turn < max_proposals:
             try:
                 opponent_vps = self._get_opponent_vps(game)
                 proposal = self.bot.propose_trade(
                     game, my_color, opponent_vps, game.vps_to_win,
+                    proposals_this_turn=self._trades_proposed_this_turn,
                 )
+                self._trades_proposed_this_turn += 1
                 if proposal:
                     self._send({"action": 11, "data": {
                         "offered": proposal["offered"],
@@ -1283,8 +1363,8 @@ class BridgeServer:
                     self._first_accept_time = 0.0
                     self._pending_trade_proposal = proposal
                     logger.info(
-                        f"Proposed trade: offer {proposal['offered']} "
-                        f"for {proposal['wanted']}"
+                        f"Proposed trade #{self._trades_proposed_this_turn}: "
+                        f"offer {proposal['offered']} for {proposal['wanted']}"
                     )
                     return  # Wait for responses
             except Exception as e:

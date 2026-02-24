@@ -465,7 +465,7 @@ def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
 
 def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, feature_stds,
                              search_depth=2, dice_sample_size=5, vps_to_win=10,
-                             blend_leaf_fn=None):
+                             blend_leaf_fn=None, with_ranking=False):
     """Play one game with BitboardSearchPlayer (both sides) for ExIt training.
 
     Records:
@@ -484,11 +484,15 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
         blend_leaf_fn: Optional fn(bb_state, color) -> float in [-1, +1].
             When provided, records continuous blend evaluation as value target
             instead of binary game outcome. Use make_blend_leaf_fn() to create.
+        with_ranking: If True, evaluate all legal child states with bb_value_fn
+            at each decision point and return per-action scores for ranking loss.
 
     Returns:
         records: list of SelfPlayRecord
         winner: Color or None
         num_turns: int
+        ranking_records: list of (child_features, child_scores) tuples
+            Only returned when with_ranking=True, otherwise omitted.
     """
     from robottler.search_player import BitboardSearchPlayer
 
@@ -508,7 +512,10 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
     game = Game(players=[p1, p2], vps_to_win=vps_to_win)
     feature_indexer.update_map(game.state.board.map)
 
+    from robottler.bitboard.actions import bb_apply_action
+
     raw_records = []  # (features, policy_target, color, value_target_or_None)
+    ranking_records = []  # (child_features_array, child_scores_array)
     feat_buf = np.zeros(n_features, dtype=np.float32)
 
     while game.winning_color() is None and game.state.num_turns < 1000:
@@ -532,6 +539,29 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
         blend_value = None
         if blend_leaf_fn is not None:
             blend_value = blend_leaf_fn(bb_state, current.color)
+
+        # Ranking data: evaluate all legal child states
+        if with_ranking and len(actions) >= 2:
+            child_feats = []
+            child_scores = []
+            child_buf = np.zeros(n_features, dtype=np.float32)
+            for action in actions:
+                try:
+                    to_action_space(action)
+                except (ValueError, IndexError):
+                    continue  # skip unmappable actions
+                child_bb = bb_state.copy()
+                bb_apply_action(child_bb, action)
+                child_score = bb_value_fn(child_bb, current.color)
+                child_buf[:] = 0.0
+                bb_fill_feature_vector(child_bb, current.color, child_buf, feature_indexer)
+                child_feats.append(child_buf.copy())
+                child_scores.append(child_score)
+            if len(child_feats) >= 2:
+                ranking_records.append((
+                    np.array(child_feats, dtype=np.float32),
+                    np.array(child_scores, dtype=np.float32),
+                ))
 
         # Get the search player's chosen action
         chosen = current.decide(game, actions)
@@ -565,6 +595,8 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
             value_target = -1.0
         records.append(SelfPlayRecord(features, policy_target, value_target))
 
+    if with_ranking:
+        return records, winner, game.state.num_turns, ranking_records
     return records, winner, game.state.num_turns
 
 
@@ -581,7 +613,7 @@ _expert_worker_blend_leaf_fn = None
 
 
 def _expert_worker_init(bc_path, blend_weight, search_depth, dice_sample_size,
-                         vps_to_win, distill_values):
+                         vps_to_win, distill_values, with_ranking=False):
     """Initialize per-worker state for expert iteration: load blend value fn."""
     global _expert_worker_value_fn, _expert_worker_fi
     global _expert_worker_means, _expert_worker_stds, _expert_worker_kwargs
@@ -611,26 +643,39 @@ def _expert_worker_init(bc_path, blend_weight, search_depth, dice_sample_size,
         'search_depth': search_depth,
         'dice_sample_size': dice_sample_size,
         'vps_to_win': vps_to_win,
+        'with_ranking': with_ranking,
     }
 
 
 def _expert_worker_play_one(_game_idx):
     """Play one expert game in a worker."""
-    records, winner, turns = generate_one_game_expert(
-        _expert_worker_value_fn, _expert_worker_fi,
-        _expert_worker_means, _expert_worker_stds,
-        blend_leaf_fn=_expert_worker_blend_leaf_fn,
-        **_expert_worker_kwargs,
-    )
+    with_ranking = _expert_worker_kwargs.get('with_ranking', False)
+    if with_ranking:
+        records, winner, turns, ranking_records = generate_one_game_expert(
+            _expert_worker_value_fn, _expert_worker_fi,
+            _expert_worker_means, _expert_worker_stds,
+            blend_leaf_fn=_expert_worker_blend_leaf_fn,
+            **_expert_worker_kwargs,
+        )
+    else:
+        records, winner, turns = generate_one_game_expert(
+            _expert_worker_value_fn, _expert_worker_fi,
+            _expert_worker_means, _expert_worker_stds,
+            blend_leaf_fn=_expert_worker_blend_leaf_fn,
+            **_expert_worker_kwargs,
+        )
+        ranking_records = []
     features = [r.features for r in records]
     policies = [r.policy_target for r in records]
     values = [r.value_target for r in records]
-    return (features, policies, values, str(winner), turns)
+    # Serialize ranking records as lists for pickling
+    ranking_serial = [(cf.tolist(), cs.tolist()) for cf, cs in ranking_records]
+    return (features, policies, values, str(winner), turns, ranking_serial)
 
 
 def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5,
                           blend_weight=1e10, vps_to_win=10, output_dir=None,
-                          workers=1, distill_values=False):
+                          workers=1, distill_values=False, with_ranking=False):
     """Generate expert iteration data using BitboardSearchPlayer.
 
     Same output format as generate_games() (features.npy, policies.npy, values.npy)
@@ -645,6 +690,7 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
         vps_to_win: Victory points to win
         output_dir: Directory to save data (with resume support)
         workers: Number of parallel worker processes
+        with_ranking: If True, also generate ranking data (per-action expert scores)
 
     Returns:
         all_records: list of SelfPlayRecord
@@ -695,6 +741,8 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
 
     remaining = num_games - start_game
 
+    all_ranking_records = []
+
     if workers <= 1:
         # Sequential path
         bb_value_fn = make_bb_blended_value_fn(bc_path, blend_weight=blend_weight)
@@ -712,13 +760,24 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
 
         for i in tqdm(range(start_game, num_games), desc="Expert games",
                       initial=start_game, total=num_games):
-            records, winner, turns = generate_one_game_expert(
-                bb_value_fn, fi, feat_means, feat_stds,
-                search_depth=search_depth,
-                dice_sample_size=dice_sample_size,
-                vps_to_win=vps_to_win,
-                blend_leaf_fn=seq_blend_leaf_fn,
-            )
+            if with_ranking:
+                records, winner, turns, ranking_recs = generate_one_game_expert(
+                    bb_value_fn, fi, feat_means, feat_stds,
+                    search_depth=search_depth,
+                    dice_sample_size=dice_sample_size,
+                    vps_to_win=vps_to_win,
+                    blend_leaf_fn=seq_blend_leaf_fn,
+                    with_ranking=True,
+                )
+                all_ranking_records.extend(ranking_recs)
+            else:
+                records, winner, turns = generate_one_game_expert(
+                    bb_value_fn, fi, feat_means, feat_stds,
+                    search_depth=search_depth,
+                    dice_sample_size=dice_sample_size,
+                    vps_to_win=vps_to_win,
+                    blend_leaf_fn=seq_blend_leaf_fn,
+                )
             all_records.extend(records)
             total_turns += turns
             winners[winner] = winners.get(winner, 0) + 1
@@ -739,20 +798,28 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
         print(f"Using {workers} parallel workers for expert game generation")
         if distill_values:
             print(f"  Value distillation enabled (blend leaf fn)")
+        if with_ranking:
+            print(f"  Ranking data generation enabled")
         games_done = start_game
         with mp.Pool(
             processes=workers,
             initializer=_expert_worker_init,
             initargs=(bc_path, blend_weight, search_depth, dice_sample_size,
-                      vps_to_win, distill_values),
+                      vps_to_win, distill_values, with_ranking),
         ) as pool:
             for result in tqdm(
                 pool.imap_unordered(_expert_worker_play_one, range(remaining)),
                 total=remaining, desc="Expert games", initial=start_game,
             ):
-                features_list, policies_list, values_list, winner_str, turns = result
+                features_list, policies_list, values_list, winner_str, turns, ranking_serial = result
                 for feat, pol, val in zip(features_list, policies_list, values_list):
                     all_records.append(SelfPlayRecord(feat, pol, val))
+                # Deserialize ranking records
+                for cf_list, cs_list in ranking_serial:
+                    all_ranking_records.append((
+                        np.array(cf_list, dtype=np.float32),
+                        np.array(cs_list, dtype=np.float32),
+                    ))
                 total_turns += turns
                 if winner_str in ('None', 'null'):
                     winners[None] = winners.get(None, 0) + 1
@@ -786,6 +853,10 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
                     'winners': {str(k): v for k, v in winners.items()},
                     'method': 'expert',
                 }, f)
+
+    # Save ranking data if generated
+    if with_ranking and all_ranking_records and output_dir is not None:
+        save_ranking_records(all_ranking_records, output_dir)
 
     stats = {
         'num_games': num_games,
@@ -1044,6 +1115,45 @@ def load_records(data_dir):
     return features, policies, values
 
 
+def save_ranking_records(ranking_records, output_dir):
+    """Save ranking data in CSR-style format.
+
+    Args:
+        ranking_records: list of (child_features[n_children, 176], child_scores[n_children])
+        output_dir: directory to save to
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    all_feats = []
+    all_scores = []
+    offsets = [0]
+    for child_feats, child_scores in ranking_records:
+        all_feats.append(child_feats)
+        all_scores.append(child_scores)
+        offsets.append(offsets[-1] + len(child_scores))
+    cat_feats = np.concatenate(all_feats)
+    cat_scores = np.concatenate(all_scores)
+    offsets_arr = np.array(offsets, dtype=np.int64)
+    np.save(os.path.join(output_dir, 'ranking_child_features.npy'), cat_feats)
+    np.save(os.path.join(output_dir, 'ranking_child_scores.npy'), cat_scores)
+    np.save(os.path.join(output_dir, 'ranking_offsets.npy'), offsets_arr)
+    print(f"Saved ranking data to {output_dir}: "
+          f"{len(ranking_records)} positions, {len(cat_scores)} children total")
+
+
+def load_ranking_records(data_dir):
+    """Load ranking data from CSR-style format.
+
+    Returns:
+        child_feats: [total_children, 176] float32
+        child_scores: [total_children] float32
+        offsets: [num_positions + 1] int64
+    """
+    child_feats = np.load(os.path.join(data_dir, 'ranking_child_features.npy'))
+    child_scores = np.load(os.path.join(data_dir, 'ranking_child_scores.npy'))
+    offsets = np.load(os.path.join(data_dir, 'ranking_offsets.npy'))
+    return child_feats, child_scores, offsets
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -1135,7 +1245,9 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                   label_smoothing=0.0, scheduler='cosine',
                   body_dims=None, dropout=0.0,
                   resume_training=None,
-                  loss_asymmetry=0.0, negative_oversample=0.0):
+                  loss_asymmetry=0.0, negative_oversample=0.0,
+                  ranking_data_dirs=None, ranking_weight=1.0,
+                  ranking_margin=0.3):
     """Train AlphaZero network on self-play data, optionally mixed with human data.
 
     Args:
@@ -1175,6 +1287,13 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
         negative_oversample: Target fraction of losing positions per batch.
             0.0 = uniform sampling (default). 0.6 = 60% of each batch is
             from losing positions. Uses weighted random sampling.
+        ranking_data_dirs: List of directories containing ranking data
+            (ranking_child_features.npy, ranking_child_scores.npy, ranking_offsets.npy).
+            When provided, adds pairwise ranking loss to the training objective.
+        ranking_weight: Weight of ranking loss relative to other losses (default 1.0).
+        ranking_margin: Margin for MarginRankingLoss (default 0.3). The network
+            must predict at least this gap between better and worse moves.
+            Sweep values: 0.1 (conservative), 0.3 (moderate), 0.5 (aggressive).
 
     Returns:
         training stats dict
@@ -1284,6 +1403,38 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
     n_samples = n_train
     print(f"  {n_train} train + {n_val} val samples on {device}")
 
+    # Load ranking data if provided
+    rank_feats_t = None
+    rank_scores_t = None
+    rank_offsets_t = None
+    n_rank_positions = 0
+    if ranking_data_dirs:
+        all_rank_feats = []
+        all_rank_scores = []
+        all_rank_offsets = [np.array([0], dtype=np.int64)]
+        offset_base = 0
+        for d in ranking_data_dirs:
+            rf, rs, ro = load_ranking_records(d)
+            all_rank_feats.append(rf)
+            all_rank_scores.append(rs)
+            # Shift offsets by accumulated base (skip first 0)
+            all_rank_offsets.append(ro[1:] + offset_base)
+            offset_base += len(rs)
+        cat_rf = np.concatenate(all_rank_feats).astype(np.float32)
+        cat_rs = np.concatenate(all_rank_scores).astype(np.float32)
+        cat_ro = np.concatenate(all_rank_offsets)
+        n_rank_positions = len(cat_ro) - 1
+        # Normalize ranking features with same means/stds
+        cat_rf -= f_means
+        cat_rf /= f_stds
+        rank_feats_t = torch.from_numpy(cat_rf).to(device)
+        rank_scores_t = torch.from_numpy(cat_rs).to(device)
+        rank_offsets_t = cat_ro  # keep on CPU for indexing
+        del cat_rf, cat_rs, all_rank_feats, all_rank_scores, all_rank_offsets
+        print(f"  Ranking data: {n_rank_positions} positions, "
+              f"{len(rank_scores_t)} children, "
+              f"margin={ranking_margin}, weight={ranking_weight}")
+
     # Freeze value path — what gets frozen depends on shared vs split body
     if freeze_value:
         if net.shared_body:
@@ -1391,6 +1542,39 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             p_loss = torch.tensor(0.0, device=feat_b.device)
         return value_weight * v_loss + p_loss, v_loss, p_loss
 
+    def _compute_ranking_loss(position_indices):
+        """Compute pairwise ranking loss for a batch of positions.
+
+        For each position, gets value predictions for all child states,
+        then applies MarginRankingLoss on all (better, worse) pairs.
+        """
+        total_rloss = 0.0
+        n_pairs = 0
+        for pos_idx in position_indices:
+            start = rank_offsets_t[pos_idx]
+            end = rank_offsets_t[pos_idx + 1]
+            n_children = end - start
+            if n_children < 2:
+                continue
+            feats = rank_feats_t[start:end]
+            scores = rank_scores_t[start:end]
+            # Get value predictions for all children
+            v_pred, _ = net(feats)
+            v_pred = v_pred.squeeze(-1)
+            # All pairs: score_diff[i,j] > 0 means i is better than j
+            score_diff = scores.unsqueeze(0) - scores.unsqueeze(1)  # [n, n]
+            pred_diff = v_pred.unsqueeze(0) - v_pred.unsqueeze(1)
+            mask = score_diff > 0
+            if mask.sum() == 0:
+                continue
+            # loss = max(0, margin - (pred_better - pred_worse))
+            pair_loss = F.relu(ranking_margin - pred_diff[mask])
+            total_rloss = total_rloss + pair_loss.sum()
+            n_pairs = n_pairs + mask.sum()
+        if n_pairs == 0:
+            return torch.tensor(0.0, device=device)
+        return total_rloss / n_pairs
+
     patience = 20
 
     # Precompute sampling weights for negative oversampling
@@ -1415,11 +1599,15 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
     else:
         sample_weights = None
 
+    # Ranking batch size: sample positions per training batch
+    rank_positions_per_batch = min(32, n_rank_positions) if n_rank_positions > 0 else 0
+
     for epoch in range(start_epoch, epochs):
         net.train()
         total_loss = 0.0
         total_v_loss = 0.0
         total_p_loss = 0.0
+        total_r_loss = 0.0
         n_batches = 0
 
         # Shuffle training indices each epoch (weighted or uniform)
@@ -1428,10 +1616,29 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             perm = torch.multinomial(sample_weights, n_samples, replacement=True)
         else:
             perm = torch.randperm(n_samples, device=device)
+
+        # Shuffle ranking position indices
+        if n_rank_positions > 0:
+            rank_perm = np.random.permutation(n_rank_positions)
+            rank_idx_ptr = 0
+
         for start in range(0, n_samples, batch_size):
             idx = perm[start:start + batch_size]
             loss, v_loss, p_loss = _compute_loss(
                 train_feat[idx], train_pol[idx], train_val[idx])
+
+            # Add ranking loss if available
+            r_loss_val = 0.0
+            if n_rank_positions > 0 and rank_positions_per_batch > 0:
+                # Get next batch of ranking positions (wrap around)
+                if rank_idx_ptr + rank_positions_per_batch > n_rank_positions:
+                    rank_perm = np.random.permutation(n_rank_positions)
+                    rank_idx_ptr = 0
+                pos_batch = rank_perm[rank_idx_ptr:rank_idx_ptr + rank_positions_per_batch]
+                rank_idx_ptr += rank_positions_per_batch
+                r_loss = _compute_ranking_loss(pos_batch)
+                loss = loss + ranking_weight * r_loss
+                r_loss_val = r_loss.item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -1440,6 +1647,7 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             total_loss += loss.item()
             total_v_loss += v_loss.item()
             total_p_loss += p_loss.item()
+            total_r_loss += r_loss_val
             n_batches += 1
 
         if lr_scheduler is not None:
@@ -1447,6 +1655,7 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
         avg_loss = total_loss / n_batches
         avg_v = total_v_loss / n_batches
         avg_p = total_p_loss / n_batches
+        avg_r = total_r_loss / n_batches
 
         # Validation loss
         net.eval()
@@ -1456,14 +1665,18 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             val_v_val = val_v.item()
             val_p_val = val_p.item()
 
-        history.append({
+        hist_entry = {
             'epoch': epoch, 'loss': avg_loss, 'v_loss': avg_v, 'p_loss': avg_p,
             'val_loss': val_loss_val, 'val_v_loss': val_v_val, 'val_p_loss': val_p_val,
-        })
+        }
+        if n_rank_positions > 0:
+            hist_entry['r_loss'] = avg_r
+        history.append(hist_entry)
 
         if (epoch + 1) % 2 == 0 or epoch == 0:
+            r_str = f", r={avg_r:.4f}" if n_rank_positions > 0 else ""
             print(f"  Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} "
-                  f"(v={avg_v:.4f}, p={avg_p:.4f}) | "
+                  f"(v={avg_v:.4f}, p={avg_p:.4f}{r_str}) | "
                   f"val={val_loss_val:.4f} (v={val_v_val:.4f}, p={val_p_val:.4f})")
 
         # Early stopping check
@@ -1524,7 +1737,10 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                'human_samples': n_total_samples - n_sp if human_data_dir else 0,
                'best_val_loss': best_val_loss,
                'loss_asymmetry': loss_asymmetry,
-               'negative_oversample': negative_oversample},
+               'negative_oversample': negative_oversample,
+               'ranking_weight': ranking_weight if ranking_data_dirs else 0,
+               'ranking_margin': ranking_margin if ranking_data_dirs else 0,
+               'ranking_positions': n_rank_positions},
     )
     print(f"Saved trained checkpoint to {output_path} (iteration {iteration})")
 
@@ -1960,6 +2176,15 @@ def main():
     train_parser.add_argument('--negative-oversample', type=float, default=0.0,
                               help='Target fraction of losing positions per batch. '
                                    '0.6 = 60%% losing samples per batch (default: 0.0)')
+    train_parser.add_argument('--ranking-data', nargs='+', default=None, metavar='DIR',
+                              help='Directories containing ranking data '
+                                   '(ranking_child_features.npy, ranking_child_scores.npy, '
+                                   'ranking_offsets.npy). Adds pairwise ranking loss.')
+    train_parser.add_argument('--ranking-weight', type=float, default=1.0,
+                              help='Weight of ranking loss (default: 1.0)')
+    train_parser.add_argument('--ranking-margin', type=float, default=0.3,
+                              help='Margin for MarginRankingLoss (default: 0.3). '
+                                   'Sweep: 0.1 (conservative), 0.3 (moderate), 0.5 (aggressive)')
 
     # Expert iteration data generation
     expert_parser = subparsers.add_parser('expert',
@@ -1976,6 +2201,11 @@ def main():
                                help='Record blend function evaluation as value target '
                                     'instead of binary game outcome. Produces continuous '
                                     'value targets in [-1, +1] for knowledge distillation.')
+    expert_parser.add_argument('--with-ranking', action='store_true',
+                               help='Generate ranking data: evaluate all legal child states '
+                                    'at each decision point with the blend function. '
+                                    'Saves ranking_child_features.npy, ranking_child_scores.npy, '
+                                    'ranking_offsets.npy for pairwise ranking loss training.')
 
     # Evaluate
     eval_parser = subparsers.add_parser('evaluate', help='Evaluate new vs old')
@@ -2060,6 +2290,7 @@ def main():
             output_dir=args.output_dir,
             workers=args.workers,
             distill_values=args.distill_values,
+            with_ranking=args.with_ranking,
         )
         save_records(records, args.output_dir)
         print(f"Stats: {stats}")
@@ -2082,6 +2313,9 @@ def main():
             resume_training=args.resume_training,
             loss_asymmetry=args.loss_asymmetry,
             negative_oversample=args.negative_oversample,
+            ranking_data_dirs=args.ranking_data,
+            ranking_weight=args.ranking_weight,
+            ranking_margin=args.ranking_margin,
         )
 
     elif args.command == 'evaluate':

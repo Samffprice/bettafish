@@ -165,7 +165,7 @@ class BBMCTSPlayer(Player):
                  num_simulations=800, c_puct=1.4, time_limit=None,
                  dirichlet_alpha=0.3, dirichlet_weight=0.25,
                  temperature=0.0, is_bot=True, leaf_value_fn=None,
-                 leaf_use_policy=True):
+                 leaf_use_policy=True, dice_top_k=0):
         super().__init__(color, is_bot)
         self.az_net = az_net
         self.fi = feature_indexer
@@ -180,11 +180,20 @@ class BBMCTSPlayer(Player):
         self.temperature = temperature
         self.leaf_value_fn = leaf_value_fn
         self.leaf_use_policy = leaf_use_policy
+        self.dice_top_k = dice_top_k
+
+        # Precompute top-k dice rolls if requested
+        if dice_top_k > 0:
+            sorted_rolls = sorted(DICE_PROBS.keys(), key=lambda r: DICE_PROBS[r], reverse=True)
+            self._top_k_rolls = sorted_rolls[:dice_top_k]
+            self._top_k_probs = np.array([DICE_PROBS[r] for r in self._top_k_rolls])
+            self._top_k_probs /= self._top_k_probs.sum()  # renormalize
 
         # Diagnostics
         self.diagnostics = False
         self._diag_records = []       # per-decision stats
         self._diag_sim_depths = []    # per-simulation depths within current search
+        self._diag_snapshots = []     # convergence snapshots (leader at each checkpoint)
 
         # Pre-allocate buffers
         self._feat_buf = np.zeros(self.n_features, dtype=np.float32)
@@ -216,10 +225,25 @@ class BBMCTSPlayer(Player):
 
         # Run simulations
         deadline = time.time() + self.time_limit if self.time_limit else float('inf')
-        for _ in range(self.num_simulations):
+        for sim_idx in range(self.num_simulations):
             if time.time() >= deadline:
                 break
             self._simulate(root)
+
+            # Convergence tracking (every 50 sims)
+            if (self.diagnostics and isinstance(root.children, list)
+                    and len(root.children) >= 2 and (sim_idx + 1) % 50 == 0):
+                sorted_kids = sorted(root.children,
+                                     key=lambda x: x[1].visit_count, reverse=True)
+                leader_a, leader_c = sorted_kids[0]
+                runner_c = sorted_kids[1][1]
+                self._diag_snapshots.append({
+                    'sim': sim_idx + 1,
+                    'leader': leader_a,
+                    'leader_visits': leader_c.visit_count,
+                    'leader_q': leader_c.q_value if leader_c.visit_count > 0 else 0.0,
+                    'runner_q': runner_c.q_value if runner_c.visit_count > 0 else 0.0,
+                })
 
         # Record diagnostics before action selection
         if self.diagnostics and isinstance(root.children, list) and len(root.children) > 0:
@@ -250,8 +274,10 @@ class BBMCTSPlayer(Player):
                     'top1_visits': top1_visits,
                     'actions_with_visits': actions_with_visits,
                     'q_spread': q_spread,
+                    'leader_snapshots': list(self._diag_snapshots),
                 })
             self._diag_sim_depths = []
+            self._diag_snapshots = []
 
         # Select action
         if self.temperature <= 0:
@@ -421,8 +447,12 @@ class BBMCTSPlayer(Player):
 
     def _sample_dice(self, node, action):
         """Sample dice roll weighted by probability."""
-        rolls = list(range(2, 13))
-        probs = [DICE_PROBS[r] for r in rolls]
+        if self.dice_top_k > 0:
+            rolls = self._top_k_rolls
+            probs = self._top_k_probs
+        else:
+            rolls = list(range(2, 13))
+            probs = [DICE_PROBS[r] for r in rolls]
         roll = rolls[np.random.choice(len(rolls), p=probs)]
 
         if roll in node.children:

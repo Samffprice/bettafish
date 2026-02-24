@@ -219,6 +219,9 @@ Investigated what makes the blend function work. The blend is `heuristic + 1e8 *
 | 15 | v2 finetune distill | Shared | 220K distill | 144 (ES) | 0.001 | 1.39 | 48% (100) |
 | 21 | SP r1 fine-tune | Shared | 2.11M +SP | 200 | — | — | 38% (100) |
 | 22 | SP r1 fresh (GPU) | Shared | 2.11M +SP | 200 | — | — | 44% (100) |
+| 23a | Asymmetric loss 3x | Shared | 2.07M d2+d3 | 200 | — | — | 59% (100) |
+| 23b | Neg oversample 60% | Shared | 2.07M d2+d3 | 200 | — | — | 59% (100) |
+| 23c | Asym 3x + neg 60% | Shared | 2.07M d2+d3 | 200 | — | — | 51% (100) |
 
 ### Search Player Blend Decomposition
 | # | Eval Mode | Neural Source | vs AB (n) | Delta vs heuristic |
@@ -226,6 +229,24 @@ Investigated what makes the blend function work. The blend is `heuristic + 1e8 *
 | 16 | Pure heuristic | None | 53.7% (50) | baseline |
 | 17 | BC blend 1e8 | value_net_v2 (human games) | 72.0% (50) | +18.3pp |
 | 18 | AZ blend 1e8 | az_v2_325k (expert games) | 64.0% (50) | +10.3pp |
+
+### 23a-c. Asymmetric Loss + Negative Oversampling (Value Head Fix Attempt)
+- **Architecture**: Shared body, v2 (512,256), fresh init, dropout 0.1
+- **Data**: 2.07M (same as exp #14 — all expert data)
+- **Config**: 200 epochs, lr=1e-4, cosine, batch=4096
+
+| Variant | Loss Asymmetry | Neg Oversample | vs AB (bench) | vs AB (diag) | Diagnostics |
+|---------|---------------|----------------|--------------|-------------|-------------|
+| 23a | 2.0 (3x on losses) | 0.0 | **59%** (100) | **47%** (100) | policy 73%, Q-gap 0.73, overopt 35% |
+| 23b | 0.0 | 0.6 (60% losses) | **59%** (100) | — | — |
+| 23c | 2.0 | 0.6 | **51%** (100) | **45%** (20) | policy 76%, Q-gap 0.48, overopt 43% |
+| baseline (#14) | 0.0 | 0.0 | **~55%** (600) | — | policy 55%, Q-gap 0.14, overopt 54% |
+
+Note: "bench" uses `bench_az_vs_ab.py` (no Dirichlet, 6 workers); "diag" uses `mcts_diagnostics.py` (Dirichlet alpha=0.3, single-process). Dirichlet noise reduces win rate ~10pp.
+
+- **Key finding**: All diagnostic metrics improved dramatically — 23a has 5x better Q-gap (0.73 vs 0.14), overoptimism nearly halved (35% vs 54%), policy accuracy +18pp — but **win rate did not improve**. 23a and 23b are within noise of baseline, 23c may be slightly worse.
+- **Lesson**: Improving value calibration metrics doesn't translate to better play. Better win/loss separation ≠ better MCTS decisions. The value head's overoptimism was a symptom, not the cause of the ~55% ceiling.
+- **Shallower trees** (avg depth 4.4-4.5 vs 6.5): stronger value signal causes MCTS to converge faster and explore less, which may be detrimental in stochastic Catan where exploration is valuable.
 
 ### MCTS Hybrid (AZ policy + external value)
 | # | Leaf Value Source | vs AB (n) | Notes |
@@ -268,21 +289,34 @@ Investigated what makes the blend function work. The blend is `heuristic + 1e8 *
 23. **Fine-tuning always fails** — loading weights and re-training degrades performance (exp #4, #15, #21). Must always fresh-init with `--body-dims`.
 24. **Batch size may matter** — exp #22 used 4096 (GPU) vs #14's 2048 (MPS). Needs controlled test to isolate.
 25. **n=100 benchmarks have ±10pp variance** — the original 64% measurement was a 2.9σ outlier from the true ~55% rate. Even n=100 can mislead. Multiple independent runs needed for reliable estimates.
+26. **Better diagnostics ≠ better play** — exp #23c improved value calibration dramatically (Q-gap 3.4x, overoptimism -11pp, policy accuracy +20pp) but won fewer games (51% vs ~55%). Fixing measured bottlenecks doesn't guarantee performance gains. The value head's overoptimism may be a symptom, not a cause.
+27. **Asymmetric loss / negative oversampling don't help** — neither individually (23a/b: 59%) nor combined (23c: 51%) beat baseline. Overcorrecting the value head may make MCTS too conservative and reduce beneficial exploration.
+28. **Calibration ≠ ranking** — exp #23a improved all calibration metrics (Q-gap 5x, overoptimism -19pp) but WORSENED move ranking (Kendall tau +0.28 vs +0.44, top-1 agreement 25% vs 45%). The value head can predict game outcomes better while being worse at discriminating between individual moves. MCTS needs ranking, not calibration.
 
 ## The Core Problem
 
 **MCTS at ~55% vs AB is 17pp below BBSearch (72%).** The gap is much larger than originally thought (was believed to be 8pp when we thought MCTS was at 64%).
 
-MCTS diagnostics (100-game runs with per-decision stats) reveal:
-- **Value head overoptimism**: Q > 0 in 54% of lost-game decisions. The network thinks it's winning when losing.
-- **Weak win/loss separation**: Q-trajectories diverge late but not enough (win late-game Q: +0.30, loss late-game Q: -0.13)
-- **Policy is surprisingly good**: prior top-1 matches MCTS top-1 in ~55% of decisions, top-3 captures top-1 in ~72%
-- **Decent tree depth**: avg ~6.5 sim depth with ~10 avg legal actions — search is going deep enough
-- **Q-spread is adequate**: mean 0.15, showing value head differentiates between moves
+### What Diagnostics Showed (Exp #14)
+- **Value head overoptimism**: Q > 0 in 54% of lost-game decisions
+- **Weak win/loss separation**: Q-gap only +0.14 (win Q: +0.30, loss Q: -0.13)
+- **Policy adequate**: prior top-1 matches MCTS top-1 in ~55%, top-3 captures top-1 in ~72%
+- **Decent tree depth**: avg ~6.5 sim depth, Q-spread mean 0.15
 
-The bottleneck is the **value head's inability to recognize losing positions**, not policy or search depth. MCTS can't play defensively when the value head stays positive during losses.
+### What Fixing the Diagnostics Showed (Exp #23c)
+Asymmetric loss + negative oversampling **dramatically improved all diagnostic metrics**:
+- Overoptimism: 54% → 43%, Q-gap: 0.14 → 0.475, Policy accuracy: 55% → 76%
+- But win rate **did not improve** (51% vs ~55% baseline)
 
-Value distillation hurt (exp #15: ~55% → 48%), more sims don't help (400 = 800), and the blend_leaf hybrid (exp #19: ~58%) is barely different from baseline — all consistent with the value head being the ceiling.
+**The value head's overoptimism was a symptom, not the cause.** Fixing it didn't fix the player. This means the ~55% ceiling is likely set by something diagnostics don't capture — possibly Catan's inherent stochasticity at this simulation budget, the quality ceiling of the expert data, or architectural limitations of the shared-body network.
+
+### What We've Ruled Out
+- More sims (400 = 800, confirmed)
+- Value distillation (exp #15: hurt)
+- Blend-leaf hybrid (exp #19: no help)
+- Self-play data from weak model (exp #22: hurt)
+- Fine-tuning (always degrades)
+- **Asymmetric loss / negative oversampling (exp #23: no help despite better diagnostics)**
 
 MCTS (~55%) vs BBSearch direct matchup = 38% (n=50), meaning MCTS is closer to BBSearch head-to-head than the AB benchmark suggests.
 
@@ -444,50 +478,143 @@ Self-play data damaged the value head, not the policy:
 
 **Diagnosis**: The self-play data taught the value head to be more optimistic (never admitting it's losing), which cripples MCTS's ability to avoid losing lines.
 
+### Exp #23a Profile (az_exp23a_asym.pt, 400 sims, n=100) — Asymmetric Loss
+Best diagnostics of all experiments, but no win rate improvement:
+| Metric | Exp #14 (baseline) | Exp #23a | Delta |
+|--------|-------------------|----------|-------|
+| Win rate (bench) | ~55% | 59% | within noise |
+| Win rate (diag, Dirichlet) | — | 47% | — |
+| Policy top-1 accuracy | 55% | **73%** | +18pp |
+| Policy top-3 accuracy | 72% | **88%** | +16pp |
+| Value win/loss separation | +0.14 | **+0.73** | 5.2x better |
+| Value overoptimism | 54% | **35%** | -19pp |
+| Late-game won Q | +0.30 | +0.84 | Much more confident |
+| Late-game lost Q | -0.13 | -0.23 | More negative (better) |
+| Avg sim depth | 6.5 | 4.5 | Shallower (converges faster) |
+| Visit top-1 fraction | ~55% | **62%** | More decisive |
+| Q-value spread | 0.15 | **0.22** | Stronger signal |
+
+**Diagnosis**: Every diagnostic metric improved substantially — the value head is dramatically better calibrated, and the policy accuracy jumped as a side effect of the shared body learning better representations. Yet the win rate is unchanged. This proves that **value head calibration was NOT the MCTS performance bottleneck**. The ~55% ceiling is set by something else entirely (likely expert data quality, Catan stochasticity, or representational limits of the MLP architecture).
+
+### Full Exp #23 Diagnostic Comparison (all n=100, 400 sims, Dirichlet)
+
+| Metric | #14 (baseline) | #23a (asym) | #23b (negsamp) | #23c (both) |
+|--------|---------------|-------------|----------------|-------------|
+| Bench win rate | ~55% (600) | 59% | 59% | 51% |
+| Diag win rate | — | 47% | 62% | 48% |
+| Policy top-1 | 55% | 73% | 75% | 76% |
+| Policy top-3 | 72% | 88% | 89% | 89% |
+| Q-gap (win-loss) | +0.14 | +0.73 | +0.76 | +0.62 |
+| Overoptimism | 54% | 35% | 36% | 41% |
+| Late won Q | +0.30 | +0.84 | +0.85 | +0.73 |
+| Late lost Q | -0.13 | -0.23 | -0.23 | -0.20 |
+| Avg sim depth | 6.5 | 4.5 | 4.5 | 4.4 |
+| Top-1 concentration | ~55% | 62% | 61% | 60% |
+| Q-spread | 0.15 | 0.22 | 0.21 | 0.23 |
+
+All three #23 variants have nearly identical diagnostics (within noise) yet diagnostic win rates range 47-62% — pure variance. The 15pp spread between 23a (47%) and 23b (62%) with identical diagnostics proves that diagnostic metrics don't predict game-to-game outcomes. All dramatically better calibrated than baseline, yet none clearly better at winning.
+
+## Deep Diagnostics (Feb 2026)
+
+New diagnostic script (`/tmp/mcts_deep_diagnostics.py`) directly measures what's wrong instead of trying fixes. Three diagnostics:
+1. **Ranking agreement**: Kendall tau between AZ neural ordering and depth-2 blend expert ordering
+2. **Pre-dice vs post-dice**: Does dice averaging compress the value head's signal?
+3. **MCTS convergence**: Q-gap between top actions, leader stability during search
+
+### Deep Diagnostic Results
+
+| Metric | Exp #14 (baseline) | Exp #23a (asym) |
+|--------|-------------------|-----------------|
+| **Kendall tau** | **+0.44 ± 0.47** | +0.28 ± 0.43 |
+| **Top-1 agreement** | **45%** | 25% |
+| Top-3 overlap | 58% | 53% |
+| MCTS = expert top-1 | **53%** | 31% |
+| Neural spread | 0.15 | 0.18 |
+| Pre-dice spread | 0.15 | 0.18 |
+| Post-dice spread | 0.16 | 0.18 |
+| **Spread ratio (post/pre)** | **1.12** | 1.70 |
+| Tau pre vs expert | +0.43 | +0.23 |
+| Tau post vs expert | +0.42 | +0.24 |
+| Q-gap top1 vs top2 | 0.039 | 0.040 |
+| **Leader stable by sim** | **65** | 76 |
+| Positions analyzed | 264 (5 games) | 275 (5 games) |
+
+### Key Findings
+
+1. **THE BOTTLENECK IS RANKING, NOT CALIBRATION.**
+   - Kendall tau = +0.44 means the value head only partially agrees with the expert on move ordering.
+   - Top-1 agreement = 45% — the neural net picks the WRONG best move 55% of the time.
+   - MCTS corrects some mistakes (53% match) but can't fully compensate.
+
+2. **DICE ARE NOT THE PROBLEM.**
+   - Spread ratio 1.12 — dice averaging doesn't compress the signal at all (ratio > 1).
+   - Pre-dice and post-dice rankings are nearly identical (tau difference < 0.01).
+   - The value head already captures dice-averaged information.
+
+3. **MCTS CONVERGES QUICKLY.**
+   - Leader stabilizes by sim 65 on average. 90% of positions converge by sim 50.
+   - More simulations won't change the outcome — the problem isn't search depth.
+
+4. **ASYMMETRIC LOSS MADE RANKING WORSE.**
+   - Exp #23a has worse tau (+0.28 vs +0.44) and worse top-1 agreement (25% vs 45%).
+   - Better win/loss calibration came at the cost of WORSE move discrimination.
+   - The model learned to be more confident about outcomes but less accurate at ranking individual moves.
+
+### Why Previous Diagnostics Were Misleading
+
+The earlier diagnostics (policy accuracy, Q-gap, overoptimism) measured **calibration** — how well the value head separates winning from losing positions on average. But MCTS doesn't need to know if it's winning or losing overall; it needs to know **which specific move is best at each decision point**.
+
+A model that always outputs +0.7 (winning) or -0.3 (losing) can have great calibration while being unable to distinguish BUILD_ROAD_A from BUILD_ROAD_B. The deep diagnostics measure exactly this: **per-action ranking quality**, which is what MCTS actually uses.
+
 ## Current Status & Path Forward
 
 ### Where We Are
 - **Best MCTS model**: ~55% vs AB (exp #14, 400 sims, az_v2_325k_200ep.pt)
 - **Best search player**: 72% vs AB (BBSearch depth 2, blend 1e8)
-- **Gap**: ~17pp — much larger than originally thought
-- **Primary bottleneck**: Value head overoptimism (doesn't recognize losing positions)
-- **Self-play data hurts** when generated by a model weaker than the expert (exp #22)
-- **Fine-tuning always hurts** — must use fresh init (exp #4, #15, #21)
+- **Gap**: ~17pp — caused by **value head ranking quality** (tau = +0.44, top-1 = 45%)
+- **Dice are irrelevant** — spread ratio > 1, no signal compression
+- **Search converges early** — more sims won't help (stable by sim 65)
 
-### The Expert Ceiling Problem
-Training on expert data (one-hot policy targets from 72% search player):
-- **Policy head** is capped at expert quality — it can only imitate what the expert does
-- **Value head** trains on game outcomes (+1/-1), but at ~55% the model is too weak for self-play to help
-- **MCTS can amplify** a good network beyond expert quality — 400 sims searches depth 10-20
-- **But** the model needs to be close enough (~70%+) for self-play data to match expert quality
-- At ~55%, the gap to self-play viability is larger than previously estimated (~15pp, not ~6pp)
+### What's Been Tried and Failed
+| Approach | Experiment | Result |
+|----------|-----------|--------|
+| More sims (800) | #14 | Same as 400 |
+| Value distillation | #15 | Worse (48%) |
+| Blend-leaf hybrid | #19 | No change (~58%) |
+| Self-play data | #22 | Worse (44%) |
+| Fine-tuning | #4, #15, #21 | Always degrades |
+| Asymmetric loss | #23a | No change (59%), WORSE ranking |
+| Negative oversampling | #23b | No change (59%) |
+| Both combined | #23c | No change (51%) |
 
-### Key Insight: Value Head Is the Bottleneck
-The diagnostics clearly identify the value head as the ceiling. The policy is adequate (~55% top-1 accuracy, ~72% top-3), search depth is reasonable (~6.5), but the value head:
-1. **Stays positive during losses** (54% overoptimism) — MCTS doesn't defend
-2. **Weak separation** (+0.14 gap) — hard to distinguish winning from losing trees
-3. **Adding self-play data makes it worse** — more optimistic, less calibrated
+### The ~55% Ceiling: Root Cause Identified
 
-### Realistic Next Steps
-1. **Fix the value head** — the current value targets are binary (+1/-1 game outcomes). The value head may need:
-   - Asymmetric loss weighting (penalize overoptimism in losses more)
-   - Auxiliary targets (VP differential, resource advantage) alongside win/loss
-   - Temperature-scaled targets (discount early-game outcomes, weight endgame)
-   - Hard negative mining (oversample positions from lost games)
-2. **More expert data at depth 3** — higher quality targets, especially for losing positions where the expert was forced into bad states
-3. **Architecture changes** — separate value body may help the value head specialize on loss detection
-4. **Hybrid approach** — use BBSearch for opening (where heuristic dominates) and MCTS for midgame/endgame
+**The value head can't rank moves correctly.** It agrees with the expert on the best move only 45% of the time (Kendall tau = +0.44). This is NOT about calibration (win/loss prediction) — it's about **per-position move ordering**. The value head evaluates each action's resulting position, and those evaluations don't consistently agree with what the expert (depth-2 blend search) sees.
 
-### What Probably Won't Help
-- More MCTS sims (400 = 800, confirmed)
-- Self-play data at current strength (exp #22 shows it hurts)
-- Fine-tuning existing checkpoint (always degrades)
-- Value distillation from blend function (exp #15, #19 show it hurts)
+Why the MLP can't rank well:
+- The heuristic encodes deep Catan domain knowledge (production value, road topology, port access, robber impact) that the MLP learns only indirectly from win/loss outcomes
+- Binary win/loss targets don't teach per-move discrimination — all moves in a winning game get +1, even bad ones
+- The MLP operates on a fixed feature vector; the heuristic has structured knowledge of board topology
+
+### Highest-Impact Remaining Directions
+
+1. **Ranking loss training** — Replace or augment MSE loss with a pairwise ranking loss. For each pair of actions at a decision point, train the value head to agree with the expert on which is better. This directly targets the diagnosed bottleneck (tau = +0.44 → higher).
+
+2. **Make depth-3 BBSearch practical** — 72% at depth 2, 84% at depth 3 but ~54s/game. This bypasses the MCTS ceiling entirely by improving the proven search player.
+
+3. **Distill expert rankings into policy head** — Instead of training the value head to rank (hard), train the policy head with soft targets from expert search (probability proportional to expert action values). The policy head already achieves 55% top-1 accuracy; explicit ranking supervision could push this higher.
+
+4. **Hybrid: expert-guided MCTS** — Use expert depth-1 evaluations as MCTS leaf values (replacing AZ value head). The expert's per-move values are already well-calibrated for ranking. This would let MCTS do deep search guided by expert-quality evaluation.
+
+### What Won't Help (Confirmed)
+- More MCTS sims (search converges by sim 65)
+- Value calibration fixes (calibration ≠ ranking)
+- Dice handling changes (no signal compression)
+- Self-play from sub-expert model
+- Fine-tuning existing checkpoints
 
 ## Open Questions
-- Can asymmetric loss weighting fix the overoptimism problem?
-- Would training the value head with VP-differential auxiliary targets improve calibration?
-- Is the policy's ~55% top-1 accuracy actually good enough, or do we need better policy too?
-- Could curriculum learning (easy positions → hard positions) help the value head learn loss detection?
-- Would a separate value body (split architecture, exp #10-#13) help if combined with overoptimism fixes?
-- Is the path forward improving the search player (better neural tiebreaker) rather than MCTS?
+- Would a pairwise ranking loss (trained on expert move orderings) break through the tau = 0.44 ceiling?
+- Can depth-3 BBSearch be made fast enough (~5s/game) with batched inference + pruning?
+- Would distilling expert rankings into the policy head (soft targets) improve MCTS more than value head fixes?
+- Is tau = 0.44 the limit of what an MLP can learn from position features, or is it a training signal problem?

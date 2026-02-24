@@ -237,7 +237,7 @@ function handleBotMessage(rawData) {
         case 14: // Execute our trade with a specific acceptee
             sendGameAction(colonistioActions.EXECUTE_TRADE, {
                 tradeId: parsedData.data.tradeId,
-                playerColor: parsedData.data.playerColor
+                playerToExecuteTradeWith: parsedData.data.playerColor
             })
             break
         default:
@@ -367,11 +367,27 @@ function patchWebSocket() {
 
         socket.binaryType = 'arraybuffer'
 
-        // Identify game socket by URL
-        if (!gameSocketConfirmed && url.includes('socket.svr.colonist.io')) {
+        // Identify game socket by URL (always capture — handles reconnection)
+        if (url.includes('socket.svr.colonist.io')) {
+            const isNew = (gameSocket !== socket)
             gameSocket = socket
             gameSocketConfirmed = true
-            console.log('[AICatan] Game socket identified by URL:', url)
+            if (isNew) {
+                // Reset protocol state for fresh connection
+                capturedServerId = null
+                outgoingSequence = 0
+                pendingSends = []
+                console.log('[AICatan] Game socket captured:', url)
+            }
+
+            // Reset state when game socket closes (enables reconnection)
+            socket.addEventListener('close', function (event) {
+                console.log('[AICatan] Game socket closed (code=' + event.code + '). Ready for reconnection.')
+                if (gameSocket === socket) {
+                    gameSocket = null
+                    gameSocketConfirmed = false
+                }
+            })
         }
 
         socket.addEventListener('message', function (event) {
@@ -422,9 +438,6 @@ function patchWebSocket() {
             }
         })
 
-        if (!gameSocketConfirmed) {
-            gameSocket = socket
-        }
         console.log('[AICatan] WebSocket intercepted:', url.substring(0, 60), gameSocketConfirmed ? '(GAME)' : '(other)')
         return socket
     }

@@ -483,8 +483,13 @@ class BotInterface:
     # Trade proposal (outbound)
     # ------------------------------------------------------------------
 
-    # Minimum value improvement to propose a trade (filters out marginal trades)
-    _MIN_PROPOSAL_DELTA = 0.0
+    # Trade proposal escalation: each successive proposal per turn must clear
+    # a higher delta threshold (fraction of position value per prior proposal).
+    # 1st=free, 2nd=0.5%, 3rd=1.0%, then hard cap.
+    _PROPOSAL_DELTA_STEP = 0.005  # 0.5% of |value_before| per prior proposal
+    _MAX_PROPOSALS_PER_TURN = 3
+
+    _PRUNE_TOP_N = 5  # Number of candidates to keep for depth-2 evaluation
 
     def propose_trade(
         self,
@@ -492,19 +497,29 @@ class BotInterface:
         our_color: Color,
         opponent_vps: Dict[int, int],
         vps_to_win: int = 10,
+        proposals_this_turn: int = 0,
     ) -> Optional[Dict]:
         """Generate the best 1:1 or 2:1 trade proposal, or None.
+
+        Two-phase evaluation:
+        1. Fast prune: depth-0 bb_vf + opponent willingness → top N candidates
+        2. Accurate eval: depth-2 bb_alphabeta on each survivor → pick best
+
+        The delta threshold escalates with each prior proposal this turn:
+        1st=free, 2nd=0.5% of position value, 3rd=1.0%, etc.
 
         Args:
             game: Reconstructed Catanatron game.
             our_color: Our Catanatron color.
             opponent_vps: {colonist_color_idx: vp_count} for all opponents.
             vps_to_win: VP target.
+            proposals_this_turn: How many proposals we've already made this turn.
 
         Returns:
             {"offered": [colonist_resource_ids], "wanted": [colonist_resource_ids]}
             or None if no good trade found.
         """
+        import time as _time
         from robottler.bitboard.convert import game_to_bitboard
         from robottler.bitboard.state import PS_WOOD
         from robottler.bitboard.masks import RESOURCE_INDEX
@@ -525,12 +540,36 @@ class BotInterface:
         for res in RESOURCES:
             hand[res] = int(bb.player_state[p_idx][PS_WOOD + RESOURCE_INDEX[res]])
 
-        value_before = bb_vf(bb, our_color)
+        # Gather opponent info (skip match-point opponents — they won't trade)
+        opponents = []
+        for opp_color in bb.color_to_index:
+            if opp_color == our_color:
+                continue
+            opp_game_idx = game.state.color_to_index[opp_color]
+            opp_vp = game.state.player_state.get(
+                f"P{opp_game_idx}_ACTUAL_VICTORY_POINTS", 0)
+            if opp_vp >= vps_to_win - 1:
+                continue
+            opp_bb_idx = bb.color_to_index[opp_color]
+            opp_hand = {}
+            for res in RESOURCES:
+                opp_hand[res] = int(
+                    bb.player_state[opp_bb_idx][PS_WOOD + RESOURCE_INDEX[res]]
+                )
+            opponents.append((opp_color, opp_bb_idx, opp_hand))
 
-        best_score = self._MIN_PROPOSAL_DELTA
-        best_proposal = None
+        if not opponents:
+            return None
 
-        # Enumerate 1:1 and 2:1 trades
+        value_before_us = bb_vf(bb, our_color)
+
+        # Escalating threshold: 1st proposal=free, then 0.5% of position value per prior
+        min_delta = proposals_this_turn * self._PROPOSAL_DELTA_STEP * abs(value_before_us)
+        skipped_no_willing = 0
+
+        # --- Phase 1: fast prune with depth-0 bb_vf + opponent willingness ---
+        candidates = []  # (delta_us, give_res, give_count, want_res)
+
         for give_res in RESOURCES:
             give_ri = RESOURCE_INDEX[give_res]
 
@@ -544,32 +583,101 @@ class BotInterface:
 
                     want_ri = RESOURCE_INDEX[want_res]
 
-                    # Apply trade to our resources
+                    # Quick depth-0 delta
                     bb.player_state[p_idx][PS_WOOD + give_ri] -= give_count
                     bb.player_state[p_idx][PS_WOOD + want_ri] += 1
-
-                    delta = bb_vf(bb, our_color) - value_before
-
-                    # Revert
+                    delta_us = bb_vf(bb, our_color) - value_before_us
                     bb.player_state[p_idx][PS_WOOD + give_ri] += give_count
                     bb.player_state[p_idx][PS_WOOD + want_ri] -= 1
 
-                    if delta > best_score:
-                        best_score = delta
-                        best_proposal = {
-                            "offered": [CATAN_RESOURCE_TO_COLONIST[give_res]] * give_count,
-                            "wanted": [CATAN_RESOURCE_TO_COLONIST[want_res]],
-                            # Keep catan names for logging/acceptee eval
-                            "_offered_catan": [give_res] * give_count,
-                            "_wanted_catan": [want_res],
-                            "_delta_us": delta,
-                        }
+                    if delta_us <= 0:
+                        continue
 
+                    # Opponent willingness heuristic
+                    any_willing = False
+                    for _, _, opp_hand in opponents:
+                        if opp_hand[want_res] < 1:
+                            continue
+                        if opp_hand[give_res] >= 3:
+                            continue
+                        any_willing = True
+                        break
+
+                    if not any_willing:
+                        skipped_no_willing += 1
+                        continue
+
+                    candidates.append((delta_us, give_res, give_count, want_res))
+
+        if not candidates:
+            logger.info(
+                f"No viable trade #{proposals_this_turn + 1} "
+                f"(skipped {skipped_no_willing} no-willing-opponent)"
+            )
+            return None
+
+        # Keep top N candidates by depth-0 score for depth-2 evaluation
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates = candidates[:self._PRUNE_TOP_N]
+
+        # --- Phase 2: depth-2 search on each survivor ---
+        player = self._get_player(our_color)
+        search_depth = 2
+        t0 = _time.monotonic()
+
+        # Baseline: depth-2 value of current position (no trade)
+        _, value_no_trade = player.bb_alphabeta(
+            bb, search_depth, float("-inf"), float("inf"),
+            _time.time() + 30, vps_to_win=vps_to_win,
+        )
+
+        best_value = value_no_trade + min_delta  # must beat no-trade + threshold
+        best_proposal = None
+
+        for d0_delta, give_res, give_count, want_res in candidates:
+            give_ri = RESOURCE_INDEX[give_res]
+            want_ri = RESOURCE_INDEX[want_res]
+
+            # Apply trade
+            bb.player_state[p_idx][PS_WOOD + give_ri] -= give_count
+            bb.player_state[p_idx][PS_WOOD + want_ri] += 1
+
+            _, value_after = player.bb_alphabeta(
+                bb, search_depth, float("-inf"), float("inf"),
+                _time.time() + 30, vps_to_win=vps_to_win,
+            )
+
+            # Revert
+            bb.player_state[p_idx][PS_WOOD + give_ri] += give_count
+            bb.player_state[p_idx][PS_WOOD + want_ri] -= 1
+
+            if value_after > best_value:
+                best_value = value_after
+                best_proposal = {
+                    "offered": [CATAN_RESOURCE_TO_COLONIST[give_res]] * give_count,
+                    "wanted": [CATAN_RESOURCE_TO_COLONIST[want_res]],
+                    "_offered_catan": [give_res] * give_count,
+                    "_wanted_catan": [want_res],
+                    "_delta_us": value_after - value_no_trade,
+                }
+
+        elapsed = _time.monotonic() - t0
         if best_proposal:
             logger.info(
-                f"Trade proposal: offer {best_proposal['_offered_catan']} "
+                f"Trade proposal #{proposals_this_turn + 1}: "
+                f"offer {best_proposal['_offered_catan']} "
                 f"for {best_proposal['_wanted_catan']} "
-                f"(delta={best_proposal['_delta_us']:.2f})"
+                f"(d2_delta={best_proposal['_delta_us']:.2f}, "
+                f"threshold={min_delta:.2f}, "
+                f"{len(candidates)} candidates searched in {elapsed:.1f}s, "
+                f"skipped {skipped_no_willing} no-willing)"
+            )
+        else:
+            logger.info(
+                f"No viable trade #{proposals_this_turn + 1} "
+                f"(no candidate beat no-trade at depth 2, "
+                f"{len(candidates)} searched in {elapsed:.1f}s, "
+                f"skipped {skipped_no_willing} no-willing)"
             )
         return best_proposal
 
