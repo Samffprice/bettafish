@@ -102,7 +102,8 @@ def make_player(kind, color, rl_model_path=None, bc_model_path=None,
         if not value_fn and not bc_model_path:
             raise ValueError("bb_search player requires --bc-model or pre-loaded bb_value_fn")
         return BitboardSearchPlayer(
-            color, bc_path=bc_model_path, depth=search_depth,
+            color, bc_path=bc_model_path if not value_fn else None,
+            depth=search_depth,
             prunning=prunning, bb_value_fn=value_fn,
             dice_sample_size=dice_sample_size,
         )
@@ -190,6 +191,10 @@ def _worker_init(p1_kind, p2_kind, kwargs):
         elif fn_type == "mcts_heuristic":
             from robottler.mcts_player import make_mcts_heuristic_value_fn
             kw["p1_value_fn"] = make_mcts_heuristic_value_fn()
+        elif fn_type == "bb_gnn_blend":
+            from robottler.search_player import make_bb_gnn_blended_value_fn
+            kw["p1_value_fn"] = make_bb_gnn_blended_value_fn(
+                rebuild["bc_model_path"], blend_weight=rebuild["blend_weight"])
 
     _worker_kwargs = kw
 
@@ -633,10 +638,21 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
     """
     from robottler.search_player import make_bb_neural_value_fn, make_bb_blended_value_fn, make_bb_heuristic_value_fn
 
+    # Auto-detect GNN checkpoint
+    import torch
+    _ckpt_peek = torch.load(bc_model_path, map_location='cpu', weights_only=False)
+    is_gnn = _ckpt_peek.get('is_gnn', False)
+    del _ckpt_peek
+
     label_parts = [f"depth={search_depth}", f"eval={eval_mode}"]
+    if is_gnn:
+        label_parts.append("GNN")
 
     # Build rebuild_spec for multiprocessing
-    if eval_mode == "heuristic":
+    if is_gnn:
+        # GNN always uses gnn_blend (heuristic + weight * gnn_value)
+        rebuild_type = "bb_gnn_blend"
+    elif eval_mode == "heuristic":
         rebuild_type = "bb_heuristic"
     elif eval_mode == "neural":
         rebuild_type = "bb_neural"
@@ -645,9 +661,11 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
     rebuild_spec = {"type": rebuild_type, "bc_model_path": bc_model_path,
                     "blend_weight": blend_weight}
 
-    if eval_mode == "heuristic":
-        print(f"Loading BB pure heuristic value fn...")
-        value_fn = make_bb_heuristic_value_fn()
+    if is_gnn:
+        from robottler.search_player import make_bb_gnn_blended_value_fn
+        print(f"Loading BB GNN blend (weight={blend_weight:.0e}) from {bc_model_path}...")
+        value_fn = make_bb_gnn_blended_value_fn(bc_model_path, blend_weight=blend_weight)
+        label_parts.append(f"weight={blend_weight:.0e}")
     elif eval_mode == "neural":
         print(f"Loading BB neural value fn from {bc_model_path}...")
         value_fn = make_bb_neural_value_fn(bc_model_path)
@@ -662,7 +680,7 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
         label_parts.append("fog" + ("" if use_counting else "-nocounting"))
 
     label = f"BB-Search ({', '.join(label_parts)})"
-    opponents = ["alphabeta"]  # TODO: restore ["random", "weighted", "value", "alphabeta"]
+    opponents = ["random", "weighted", "value", "alphabeta"]
 
     if dice_sample_size is not None:
         label_parts.append(f"dice={dice_sample_size}")
