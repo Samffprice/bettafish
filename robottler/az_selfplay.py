@@ -1337,11 +1337,14 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
                batch_size=2048, lr=1e-3, value_weight=1.0,
                label_smoothing=0.0, scheduler='cosine',
                dropout=0.2, gnn_dims=None, edge_dropout=0.1,
-               resume_training=None):
+               resume_training=None, max_samples=0):
     """Train GNN (CatanGNNet) on graph features.
 
     Loads node_features.npy [N, 54, 18] and global_features.npy [N, 76]
     from data_dirs. Creates a fresh GNN and trains with MSE value + CE policy loss.
+
+    Data stays on CPU; only the current batch is moved to GPU. This allows
+    training on datasets much larger than GPU memory (e.g., 2.5M samples on T4).
     """
     import gc
 
@@ -1364,6 +1367,7 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
     all_global_features = []
     all_policies = []
     all_values = []
+    has_any_policy = False
     for d in data_dirs:
         nf_path = os.path.join(d, 'node_features.npy')
         gf_path = os.path.join(d, 'global_features.npy')
@@ -1386,25 +1390,56 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
         # Load policies if available (human game data has no policy labels)
         pol_path = os.path.join(d, 'policies.npy')
         if os.path.exists(pol_path):
-            p = np.load(pol_path)
+            all_policies.append(np.load(pol_path))
+            has_any_policy = True
         else:
-            p = np.zeros((len(v), ACTION_SPACE_SIZE), dtype=np.float32)
+            all_policies.append(None)  # placeholder, don't allocate zeros
             print(f"  Note: no policies.npy in {d} — value-only training for this dir")
-        all_policies.append(p)
 
     node_features = np.concatenate(all_node_features).astype(np.float32)
-    del all_node_features
+    del all_node_features; gc.collect()
     global_features = np.concatenate(all_global_features).astype(np.float32)
-    del all_global_features
-    policies = np.concatenate(all_policies).astype(np.float32)
-    del all_policies
+    del all_global_features; gc.collect()
     values = np.concatenate(all_values).astype(np.float32)
-    del all_values
+    del all_values; gc.collect()
+
+    # Only concatenate policies if at least one dir has them
+    if has_any_policy:
+        # Fill None entries with zeros for dirs that lacked policies
+        for i, p in enumerate(all_policies):
+            if p is None:
+                n = len(values) if len(all_policies) == 1 else 0
+                # Determine the length from node_features shape
+                all_policies[i] = np.zeros(
+                    (node_features.shape[0] if len(all_policies) == 1
+                     else all_policies[i - 1].shape[0],  # fallback
+                     ACTION_SPACE_SIZE), dtype=np.float32)
+        policies = np.concatenate([p for p in all_policies if p is not None]).astype(np.float32)
+    else:
+        policies = None
+    del all_policies; gc.collect()
 
     n_total = len(values)
-    print(f"GNN training data: {n_total} samples from {len(data_dirs)} dir(s)")
-    print(f"  Node features: {node_features.shape}")
+
+    # Subsample if --max-samples specified (for limited-RAM environments)
+    if max_samples > 0 and n_total > max_samples:
+        print(f"  Subsampling {max_samples:,} from {n_total:,} samples")
+        rng = np.random.RandomState(42)
+        idx = rng.choice(n_total, max_samples, replace=False)
+        idx.sort()
+        node_features = node_features[idx]
+        global_features = global_features[idx]
+        values = values[idx]
+        if policies is not None:
+            policies = policies[idx]
+        n_total = max_samples
+        gc.collect()
+
+    print(f"GNN training data: {n_total:,} samples from {len(data_dirs)} dir(s)")
+    print(f"  Node features: {node_features.shape} "
+          f"({node_features.nbytes / 1e9:.1f} GB)")
     print(f"  Global features: {global_features.shape}")
+    print(f"  Policies: {'yes' if policies is not None else 'none (value-only)'}")
     print(f"  Value distribution: mean={values.mean():.3f}, std={values.std():.3f}")
 
     # Compute normalization stats (per-feature mean/std)
@@ -1444,36 +1479,39 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
     net.train()
     print(f"  Training on device: {device}")
 
-    # Train/val split
+    # Train/val split — keep data on CPU, move batches to GPU
     n_val = max(1, int(n_total * 0.1))
     n_train = n_total - n_val
-    perm = torch.randperm(n_total)
+    perm = np.random.permutation(n_total)
     train_idx = perm[:n_train]
     val_idx = perm[n_train:]
     del perm
 
-    # Move to device
-    _nf = torch.from_numpy(node_features)
-    train_nf = _nf[train_idx].to(device)
-    val_nf = _nf[val_idx].to(device)
-    del _nf, node_features; gc.collect()
+    # CPU tensors (no GPU copy of full dataset)
+    train_nf = torch.from_numpy(node_features[train_idx])
+    val_nf = torch.from_numpy(node_features[val_idx])
+    del node_features; gc.collect()
 
-    _gf = torch.from_numpy(global_features)
-    train_gf = _gf[train_idx].to(device)
-    val_gf = _gf[val_idx].to(device)
-    del _gf, global_features; gc.collect()
+    train_gf = torch.from_numpy(global_features[train_idx])
+    val_gf = torch.from_numpy(global_features[val_idx])
+    del global_features; gc.collect()
 
-    _pol = torch.from_numpy(policies)
-    train_pol = _pol[train_idx].to(device)
-    val_pol = _pol[val_idx].to(device)
-    del _pol, policies; gc.collect()
+    train_val = torch.from_numpy(values[train_idx])
+    val_val = torch.from_numpy(values[val_idx])
+    del values; gc.collect()
 
-    _val = torch.from_numpy(values)
-    train_val = _val[train_idx].to(device)
-    val_val = _val[val_idx].to(device)
-    del _val, values, train_idx, val_idx; gc.collect()
+    if policies is not None:
+        train_pol = torch.from_numpy(policies[train_idx])
+        val_pol = torch.from_numpy(policies[val_idx])
+        del policies; gc.collect()
+    else:
+        train_pol = None
+        val_pol = None
 
-    print(f"  {n_train} train + {n_val} val samples on {device}")
+    del train_idx, val_idx; gc.collect()
+
+    print(f"  {n_train:,} train + {n_val:,} val samples "
+          f"(data on CPU, batches to {device})")
 
     optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
     if scheduler == 'cosine':
@@ -1511,19 +1549,22 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
     patience = 20
 
     def _gnn_loss(nf_b, gf_b, pol_b, val_b):
-        """Compute GNN loss on a batch."""
+        """Compute GNN loss on a batch (all tensors already on device)."""
         v_pred, logits = net(nf_b, gf_b)
         v_pred = v_pred.squeeze(-1)
         v_loss = F.mse_loss(v_pred, val_b)
-        has_policy = pol_b.sum(dim=-1) > 0
-        if has_policy.any():
-            sp_logits = logits[has_policy]
-            sp_policy = pol_b[has_policy]
-            if label_smoothing > 0:
-                n_classes = sp_policy.shape[-1]
-                sp_policy = (1 - label_smoothing) * sp_policy + label_smoothing / n_classes
-            log_probs = F.log_softmax(sp_logits, dim=-1).clamp(min=-100.0)
-            p_loss = -(sp_policy * log_probs).sum(dim=-1).mean()
+        if pol_b is not None:
+            has_policy = pol_b.sum(dim=-1) > 0
+            if has_policy.any():
+                sp_logits = logits[has_policy]
+                sp_policy = pol_b[has_policy]
+                if label_smoothing > 0:
+                    n_classes = sp_policy.shape[-1]
+                    sp_policy = (1 - label_smoothing) * sp_policy + label_smoothing / n_classes
+                log_probs = F.log_softmax(sp_logits, dim=-1).clamp(min=-100.0)
+                p_loss = -(sp_policy * log_probs).sum(dim=-1).mean()
+            else:
+                p_loss = torch.tensor(0.0, device=nf_b.device)
         else:
             p_loss = torch.tensor(0.0, device=nf_b.device)
         return value_weight * v_loss + p_loss, v_loss, p_loss
@@ -1535,12 +1576,17 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
         total_p_loss = 0.0
         n_batches = 0
 
-        perm = torch.randperm(n_train, device=device)
+        perm = torch.randperm(n_train)
 
         for start in range(0, n_train, batch_size):
             idx = perm[start:start + batch_size]
-            loss, v_loss, p_loss = _gnn_loss(
-                train_nf[idx], train_gf[idx], train_pol[idx], train_val[idx])
+            # Move only this batch to device
+            nf_b = train_nf[idx].to(device, non_blocking=True)
+            gf_b = train_gf[idx].to(device, non_blocking=True)
+            val_b = train_val[idx].to(device, non_blocking=True)
+            pol_b = train_pol[idx].to(device, non_blocking=True) if train_pol is not None else None
+
+            loss, v_loss, p_loss = _gnn_loss(nf_b, gf_b, pol_b, val_b)
 
             optimizer.zero_grad()
             loss.backward()
@@ -1557,13 +1603,26 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
         avg_v = total_v_loss / n_batches
         avg_p = total_p_loss / n_batches
 
-        # Validation
+        # Validation (in batches to avoid OOM)
         net.eval()
         with torch.no_grad():
-            val_loss, val_v, val_p = _gnn_loss(val_nf, val_gf, val_pol, val_val)
-            val_loss_val = val_loss.item()
-            val_v_val = val_v.item()
-            val_p_val = val_p.item()
+            val_losses = []
+            val_v_losses = []
+            val_p_losses = []
+            for vs in range(0, n_val, batch_size):
+                ve = min(vs + batch_size, n_val)
+                vnf = val_nf[vs:ve].to(device, non_blocking=True)
+                vgf = val_gf[vs:ve].to(device, non_blocking=True)
+                vvl = val_val[vs:ve].to(device, non_blocking=True)
+                vpl = val_pol[vs:ve].to(device, non_blocking=True) if val_pol is not None else None
+                vl, vv, vp = _gnn_loss(vnf, vgf, vpl, vvl)
+                w = ve - vs
+                val_losses.append(vl.item() * w)
+                val_v_losses.append(vv.item() * w)
+                val_p_losses.append(vp.item() * w)
+            val_loss_val = sum(val_losses) / n_val
+            val_v_val = sum(val_v_losses) / n_val
+            val_p_val = sum(val_p_losses) / n_val
 
         hist_entry = {
             'epoch': epoch, 'loss': avg_loss, 'v_loss': avg_v, 'p_loss': avg_p,
@@ -1638,7 +1697,8 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                   loss_asymmetry=0.0, negative_oversample=0.0,
                   ranking_data_dirs=None, ranking_weight=1.0,
                   ranking_margin=0.3,
-                  gnn=False, gnn_dims=None, edge_dropout=0.1):
+                  gnn=False, gnn_dims=None, edge_dropout=0.1,
+                  max_samples=0):
     """Train AlphaZero network on self-play data, optionally mixed with human data.
 
     Args:
@@ -1700,7 +1760,7 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             batch_size=batch_size, lr=lr, value_weight=value_weight,
             label_smoothing=label_smoothing, scheduler=scheduler,
             dropout=dropout, gnn_dims=gnn_dims, edge_dropout=edge_dropout,
-            resume_training=resume_training,
+            resume_training=resume_training, max_samples=max_samples,
         )
     # Pick best available device
     if torch.backends.mps.is_available():
@@ -2611,6 +2671,9 @@ def main():
                                    '(e.g., "32,64,96"). Default: 32,64,96 (~45K params).')
     train_parser.add_argument('--edge-dropout', type=float, default=0.1,
                               help='Edge dropout (DropEdge) rate for GNN training (default 0.1).')
+    train_parser.add_argument('--max-samples', type=int, default=0,
+                              help='Max training samples (0 = use all). '
+                                   'Use 500000-1000000 for Colab T4 to fit in RAM.')
 
     # Expert iteration data generation
     expert_parser = subparsers.add_parser('expert',
@@ -2754,6 +2817,7 @@ def main():
             ranking_margin=args.ranking_margin,
             gnn=args.gnn, gnn_dims=gnn_dims,
             edge_dropout=args.edge_dropout,
+            max_samples=args.max_samples,
         )
 
     elif args.command == 'evaluate':

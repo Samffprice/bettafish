@@ -1840,8 +1840,8 @@ if __name__ == "__main__":
     parser.add_argument("--bot", type=str, default="search",
                         choices=["search", "value", "neural", "mcts", "random"],
                         help="Bot type (default: search)")
-    parser.add_argument("--search-depth", type=int, default=3,
-                        help="Search depth for search bot (default: 3)")
+    parser.add_argument("--search-depth", type=int, default=2,
+                        help="Search depth for search bot (default: 2)")
     parser.add_argument("--blend-weight", type=float, default=1e8,
                         help="Blend weight for search bot (default: 1e8)")
     parser.add_argument("--bc-model", type=str, default="robottler/models/value_net_v2.pt",
@@ -1849,8 +1849,8 @@ if __name__ == "__main__":
     parser.add_argument("--trade-strategy", type=str, default="blend",
                         choices=["blend", "heuristic"],
                         help="Trade evaluation strategy (default: blend)")
-    parser.add_argument("--propose-trades", action="store_true",
-                        help="Enable bot trade proposals (default: off)")
+    parser.add_argument("--propose-trades", action="store_true", default=True,
+                        help="Enable bot trade proposals (default: on)")
     args = parser.parse_args()
     anticheat = False if args.no_anticheat else None
     asyncio.run(main(

@@ -3,6 +3,9 @@ datasets/*
 !datasets/*.py
 !datasets/__pycache__
 
+# Data zip files (uploaded to Google Drive, not git)
+*.zip
+
 # Game logs (may contain session metadata)
 logs/
 
