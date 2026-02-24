@@ -1134,7 +1134,8 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                   freeze_value=False, differential_lr=False,
                   label_smoothing=0.0, scheduler='cosine',
                   body_dims=None, dropout=0.0,
-                  resume_training=None):
+                  resume_training=None,
+                  loss_asymmetry=0.0, negative_oversample=0.0):
     """Train AlphaZero network on self-play data, optionally mixed with human data.
 
     Args:
@@ -1168,6 +1169,12 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
         resume_training: Path to a training checkpoint to resume from.
             Restores model weights, optimizer state, LR scheduler state,
             best val loss, and epoch counter. Resumes from last completed epoch.
+        loss_asymmetry: Extra weight on value loss for losing positions (value < 0).
+            A value of 2.0 means losses from losing positions are weighted 3x
+            (1 + 2.0) vs 1x for winning positions. Default 0.0 (symmetric).
+        negative_oversample: Target fraction of losing positions per batch.
+            0.0 = uniform sampling (default). 0.6 = 60% of each batch is
+            from losing positions. Uses weighted random sampling.
 
     Returns:
         training stats dict
@@ -1324,6 +1331,10 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
 
     if label_smoothing > 0:
         print(f"  Label smoothing: {label_smoothing}")
+    if loss_asymmetry > 0:
+        print(f"  Asymmetric value loss: losing positions weighted {1+loss_asymmetry:.1f}x")
+    if negative_oversample > 0:
+        print(f"  Negative oversampling: target {negative_oversample*100:.0f}% losing positions per batch")
 
     # Resume from training checkpoint if provided
     start_epoch = 0
@@ -1358,7 +1369,15 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
         """Compute combined loss on a batch."""
         v_pred, logits = net(feat_b)
         v_pred = v_pred.squeeze(-1)
-        v_loss = F.mse_loss(v_pred, val_b)
+        if loss_asymmetry > 0:
+            # Per-sample MSE with higher weight on losing positions
+            per_sample_mse = (v_pred - val_b) ** 2
+            weights = torch.where(val_b < 0,
+                                  1.0 + loss_asymmetry,
+                                  torch.ones_like(val_b))
+            v_loss = (per_sample_mse * weights).mean()
+        else:
+            v_loss = F.mse_loss(v_pred, val_b)
         has_policy = pol_b.sum(dim=-1) > 0
         if has_policy.any():
             sp_logits = logits[has_policy]
@@ -1374,6 +1393,28 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
 
     patience = 20
 
+    # Precompute sampling weights for negative oversampling
+    if negative_oversample > 0:
+        is_neg = (train_val < 0).float()
+        n_neg = is_neg.sum().item()
+        n_pos = n_samples - n_neg
+        if n_neg > 0 and n_pos > 0:
+            # Set weights so that negative fraction in expectation = negative_oversample
+            # w_neg / (w_neg * n_neg + w_pos * n_pos) = target_frac
+            # Let w_pos = 1, solve for w_neg:
+            target_frac = negative_oversample
+            w_neg = target_frac * n_pos / ((1 - target_frac) * n_neg)
+            sample_weights = torch.where(is_neg > 0, w_neg, 1.0)
+            print(f"  Negative oversampling: {n_neg}/{n_samples} neg samples "
+                  f"({n_neg/n_samples*100:.1f}%), target={target_frac*100:.0f}%, "
+                  f"w_neg={w_neg:.2f}")
+        else:
+            sample_weights = None
+            print(f"  Warning: negative_oversample={negative_oversample} but "
+                  f"n_neg={n_neg}, n_pos={n_pos} — using uniform sampling")
+    else:
+        sample_weights = None
+
     for epoch in range(start_epoch, epochs):
         net.train()
         total_loss = 0.0
@@ -1381,8 +1422,12 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
         total_p_loss = 0.0
         n_batches = 0
 
-        # Shuffle training indices each epoch
-        perm = torch.randperm(n_samples, device=device)
+        # Shuffle training indices each epoch (weighted or uniform)
+        if sample_weights is not None:
+            # multinomial inherits device from sample_weights (same as train_val)
+            perm = torch.multinomial(sample_weights, n_samples, replacement=True)
+        else:
+            perm = torch.randperm(n_samples, device=device)
         for start in range(0, n_samples, batch_size):
             idx = perm[start:start + batch_size]
             loss, v_loss, p_loss = _compute_loss(
@@ -1477,7 +1522,9 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
         extra={'training_history': history, 'num_samples': n_total_samples,
                'freeze_value': freeze_value, 'differential_lr': differential_lr,
                'human_samples': n_total_samples - n_sp if human_data_dir else 0,
-               'best_val_loss': best_val_loss},
+               'best_val_loss': best_val_loss,
+               'loss_asymmetry': loss_asymmetry,
+               'negative_oversample': negative_oversample},
     )
     print(f"Saved trained checkpoint to {output_path} (iteration {iteration})")
 
@@ -1907,6 +1954,12 @@ def main():
     train_parser.add_argument('--resume-training', default=None, metavar='PATH',
                               help='Resume from a training checkpoint (_training.pt). '
                                    'Restores model, optimizer, scheduler, and epoch.')
+    train_parser.add_argument('--loss-asymmetry', type=float, default=0.0,
+                              help='Extra weight on value loss for losing positions. '
+                                   '2.0 = losing positions weighted 3x (default: 0.0)')
+    train_parser.add_argument('--negative-oversample', type=float, default=0.0,
+                              help='Target fraction of losing positions per batch. '
+                                   '0.6 = 60%% losing samples per batch (default: 0.0)')
 
     # Expert iteration data generation
     expert_parser = subparsers.add_parser('expert',
@@ -2027,6 +2080,8 @@ def main():
             scheduler=args.scheduler,
             body_dims=body_dims, dropout=args.dropout,
             resume_training=args.resume_training,
+            loss_asymmetry=args.loss_asymmetry,
+            negative_oversample=args.negative_oversample,
         )
 
     elif args.command == 'evaluate':

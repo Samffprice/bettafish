@@ -136,10 +136,15 @@ Switched from 176→256→128 (114K params) to 176→512→256 (325K params) wit
 - **Config**: 200 epochs, lr=1e-4, cosine, uniform LR (no differential — fresh network), batch=2048
 - **Final losses**: v=0.444, p=1.592 (total=2.035)
 - **Loss at ep100**: v=0.471, p=1.600 (total=2.072)
-- **Result**: **64% vs AB (n=100, 400 sims), 64% vs AB (n=100, 800 sims)**
+- **Result**: **~55% vs AB (revised estimate; original 64% was a statistical outlier)**
+  - Original measurement: 64/100 (400 sims), 64/100 (800 sims) — both on same day
+  - Reproduction runs (same script, same checkpoint): 59/100, 51/100, 54/100, 50/100
+  - Pooled 6 runs (600 games): 342/600 = **57%** [53%, 61%]
+  - Best estimate: **~55% vs AB** (400 or 800 sims — no difference)
 - **vs BBSearch depth 2**: 38% (n=50, 400 sims)
-- **Note**: New best by 10pp over exp #3. Bigger network + more data + dropout solved the "more data hurts" problem from #7. 800 sims = same as 400 → value head is the bottleneck, not search depth. Policy still plateaued at 1.59 (similar to smaller models), suggesting policy capacity isn't the limiting factor either.
+- **Note**: Best model overall, but ~17pp below BBSearch (72%), not 8pp as initially thought. Bigger network + more data + dropout solved the "more data hurts" problem from #7. 800 sims = same as 400 → value head is the bottleneck, not search depth.
 - **Checkpoint**: `datasets/az_v2_325k_200ep.pt`
+- **Bug found**: `BBMCTSPlayer.decide()` was missing `fi.update_map(game.state.board.map)` — production features used wrong map when player was reused across games. Fixed (not yet committed). Original benchmark created new player per game with correct map, so was unaffected.
 
 ### 15. Fine-tune exp #14 on distill data only (220K samples)
 - **Architecture**: Shared body (512, 256), dropout=0.1, loaded from exp #14
@@ -149,7 +154,7 @@ Switched from 176→256→128 (114K params) to 176→512→256 (325K params) wit
 - **Config**: 200 epochs (early stopped at ep 144, restored ep 124), lr=1e-4, cosine, batch=2048, 90/10 train/val split
 - **Final losses**: v=0.001, p=1.39 | val: v=0.001, p=1.49
 - **Result**: **48% vs AB (n=100, 400 sims)**
-- **Note**: Performance DEGRADED from 64% → 48% despite lower losses. Consistent with the recurring pattern: lower loss ≠ better performance. Likely catastrophic forgetting from fine-tuning on small dataset (220K samples, 0.67:1 ratio with 325K params). Value head learned blend values perfectly (v=0.001) but lost the sharp win/loss distinctions MCTS needs.
+- **Note**: Performance degraded from ~55% → 48% (smaller gap than originally thought with revised exp #14 baseline). Lower loss ≠ better performance. Value head learned blend values perfectly (v=0.001) but lost the sharp win/loss distinctions MCTS needs.
 - **Checkpoint**: `datasets/az_v2_finetune_distill.pt`
 
 ---
@@ -210,8 +215,10 @@ Investigated what makes the blend function work. The blend is `heuristic + 1e8 *
 | 11 | Split unfrozen d3 | Split | 69K d3 | 500 | 0.18 | 1.45 | 18% (100) |
 | 12 | Split unfrozen d3 2k | Split | 69K d3 | 2000 | 0.06 | 1.08 | — |
 | 13 | Split frozen d3 | Split | 69K d3 | 500 | 0.84 | 1.82 | 42% (100) |
-| **14** | **v2 325K fresh** | **Shared** | **2.07M d2+d3** | **200** | **0.44** | **1.59** | **64% (100)** |
+| **14** | **v2 325K fresh** | **Shared** | **2.07M d2+d3** | **200** | **0.44** | **1.59** | **~55% (600)** |
 | 15 | v2 finetune distill | Shared | 220K distill | 144 (ES) | 0.001 | 1.39 | 48% (100) |
+| 21 | SP r1 fine-tune | Shared | 2.11M +SP | 200 | — | — | 38% (100) |
+| 22 | SP r1 fresh (GPU) | Shared | 2.11M +SP | 200 | — | — | 44% (100) |
 
 ### Search Player Blend Decomposition
 | # | Eval Mode | Neural Source | vs AB (n) | Delta vs heuristic |
@@ -223,14 +230,14 @@ Investigated what makes the blend function work. The blend is `heuristic + 1e8 *
 ### MCTS Hybrid (AZ policy + external value)
 | # | Leaf Value Source | vs AB (n) | Notes |
 |---|-------------------|-----------|-------|
-| 14 | AZ value head (pure) | 64% (100) | baseline MCTS |
-| 19 | blend_leaf (normalized blend) | ~58% (2×50) | worse — compressed range hurts MCTS |
+| 14 | AZ value head (pure) | ~55% (600) | baseline MCTS (revised) |
+| 19 | blend_leaf (normalized blend) | ~58% (2×50) | similar to baseline — compressed range |
 | 20 | pure heuristic (tanh/1e14) | 8% (50) | broken normalization — all values ≈ 1.0 |
 
 ## Key Lessons
 
 ### Training
-1. **v2 325K on 2.07M is best MCTS model (64%)** — bigger network + more data + dropout
+1. **v2 325K on 2.07M is best MCTS model (~55%)** — bigger network + more data + dropout
 2. **"More data hurts" was a capacity problem** — exp #7 (114K params, 1.36M data) degraded to 50%, but exp #14 (325K params, 2.07M data) improved to 64%
 3. **Dropout 0.1 is critical for larger networks** — prevents overfitting on large datasets
 4. **Fresh init > warm-start for larger architectures** — uniform LR works when nothing to protect
@@ -244,36 +251,47 @@ Investigated what makes the blend function work. The blend is `heuristic + 1e8 *
 
 ### Value Function
 12. **MCTS needs decisive values, not accurate ones** — the AZ value head (v_loss=0.44, outputs near ±1) beats both the blend_leaf (v_loss=0.001, outputs ±0.4) and distilled value head at MCTS. Sharp win/loss signals > precise position evaluations.
-13. **More MCTS sims don't help once value head is saturated** — 400 and 800 sims both give 64%
-14. **Value distillation hurts MCTS** — exp #15 (fine-tune on blend targets): 64% → 48%. Exp #19 (blend_leaf at inference): 64% → 58%. Both compressed value ranges degraded MCTS tree search.
+13. **More MCTS sims don't help once value head is saturated** — 400 and 800 sims both give ~55%
+14. **Value distillation hurts MCTS** — exp #15 (fine-tune on blend targets): ~55% → 48%. Compressed value ranges degrade MCTS tree search.
+15. **Value head is overoptimistic** — MCTS diagnostics show Q > 0 in 54% of lost-game decisions (exp #14). The network doesn't properly recognize losing positions, so MCTS can't prioritize defensive moves.
 
 ### Blend / Search Player
-15. **The heuristic completely dominates the blend** (~6e14 vs ~1e7 for neural*1e8). Neural is a tiebreaker only.
-16. **The neural tiebreaker is worth ~18pp in minimax** — pure heuristic 53.7% vs BC blend 72%
-17. **A "better" neural net makes a WORSE minimax tiebreaker** — AZ v2 (+10pp) vs BC net (+18pp). Being good at MCTS ≠ being good at tie-breaking in minimax.
-18. **Minimax + heuristic > MCTS + neural at same compute** — BBSearch depth 2 (72%) beats MCTS 400 sims (64%). The hand-crafted heuristic encodes Catan knowledge that the neural net hasn't learned.
+16. **The heuristic completely dominates the blend** (~6e14 vs ~1e7 for neural*1e8). Neural is a tiebreaker only.
+17. **The neural tiebreaker is worth ~18pp in minimax** — pure heuristic 53.7% vs BC blend 72%
+18. **A "better" neural net makes a WORSE minimax tiebreaker** — AZ v2 (+10pp) vs BC net (+18pp). Being good at MCTS ≠ being good at tie-breaking in minimax.
+19. **Minimax + heuristic >> MCTS + neural** — BBSearch depth 2 (72%) beats MCTS 400 sims (~55%). The gap is ~17pp, not 8pp as originally thought. The hand-crafted heuristic encodes Catan knowledge that the neural net hasn't learned.
 
 ### Data
-19. **MCTS self-play data is harmful** when generated by a weak policy (games 265 turns)
-20. **Depth-3 targets help when mixed into large dataset** but not alone (20× less data)
+20. **MCTS self-play data is harmful** when generated by a weak policy (games 265 turns)
+21. **Depth-3 targets help when mixed into large dataset** but not alone (20× less data)
+22. **Self-play data from a sub-expert model hurts** — exp #22 added 40K self-play from ~55% model to 2.07M expert data → 44% (down from ~55%). The model's data is lower quality than the expert data (72% search player), diluting the training signal. MCTS diagnostics confirm: value head overoptimism 65% (vs 54% for exp #14), late-game loss Q still positive (+0.148 vs -0.127).
+23. **Fine-tuning always fails** — loading weights and re-training degrades performance (exp #4, #15, #21). Must always fresh-init with `--body-dims`.
+24. **Batch size may matter** — exp #22 used 4096 (GPU) vs #14's 2048 (MPS). Needs controlled test to isolate.
+25. **n=100 benchmarks have ±10pp variance** — the original 64% measurement was a 2.9σ outlier from the true ~55% rate. Even n=100 can mislead. Multiple independent runs needed for reliable estimates.
 
 ## The Core Problem
 
-Every attempt to give MCTS a "better" value function has made it worse:
-- Distilling blend values into the value head: 64% → 48% (exp #15)
-- Using blend directly at leaves: 64% → ~58% (exp #19)
-- More MCTS sims: 64% → 64% (400 vs 800)
+**MCTS at ~55% vs AB is 17pp below BBSearch (72%).** The gap is much larger than originally thought (was believed to be 8pp when we thought MCTS was at 64%).
 
-Meanwhile, the search player gets 72% with the same heuristic that MCTS can't effectively use. The fundamental issue may be that **MCTS with 400 sims in a high-branching stochastic game like Catan doesn't build deep enough trees to benefit from precise evaluations**. It needs coarse but decisive signals to allocate its limited simulation budget effectively.
+MCTS diagnostics (100-game runs with per-decision stats) reveal:
+- **Value head overoptimism**: Q > 0 in 54% of lost-game decisions. The network thinks it's winning when losing.
+- **Weak win/loss separation**: Q-trajectories diverge late but not enough (win late-game Q: +0.30, loss late-game Q: -0.13)
+- **Policy is surprisingly good**: prior top-1 matches MCTS top-1 in ~55% of decisions, top-3 captures top-1 in ~72%
+- **Decent tree depth**: avg ~6.5 sim depth with ~10 avg legal actions — search is going deep enough
+- **Q-spread is adequate**: mean 0.15, showing value head differentiates between moves
 
-However: MCTS (64%) vs BBSearch blend direct matchup = 38%, meaning MCTS is closer to the blend than the AB benchmark suggests (blend beats AB harder than it beats MCTS). And the 64% model plays ~86-turn games in self-play — normal Catan length, not the 265-turn garbage from earlier attempts.
+The bottleneck is the **value head's inability to recognize losing positions**, not policy or search depth. MCTS can't play defensively when the value head stays positive during losses.
+
+Value distillation hurt (exp #15: ~55% → 48%), more sims don't help (400 = 800), and the blend_leaf hybrid (exp #19: ~58%) is barely different from baseline — all consistent with the value head being the ceiling.
+
+MCTS (~55%) vs BBSearch direct matchup = 38% (n=50), meaning MCTS is closer to BBSearch head-to-head than the AB benchmark suggests.
 
 ---
 
 ## Self-Play Pipeline (Phase 6B)
 
 ### Motivation
-Expert iteration hit a wall at 64% vs AB. The model can't surpass the expert (72% BBSearch) through imitation alone. Self-play is the path to improvement without a ceiling — the model learns from its own games, discovering strategies the expert doesn't use. The 64% model now plays reasonable ~86-turn games (vs 265 turns when self-play was first attempted at ~10-20% strength).
+Expert iteration reached ~55% vs AB. The model can't surpass the expert (72% BBSearch) through imitation alone. Self-play is the path to improvement without a ceiling — the model learns from its own games, discovering strategies the expert doesn't use. The ~55% model plays reasonable ~86-turn games (vs 265 turns when self-play was first attempted at ~10-20% strength). However, diagnostics show the model is too weak for useful self-play data (value head overoptimism prevents learning from losses).
 
 ### Key Advantage of Self-Play Data
 MCTS self-play produces **soft policy targets** (visit count distributions over all 290 actions) instead of one-hot expert targets. This is richer signal — "action A: 60%, B: 25%, C: 15%" vs "the expert picked A." The value targets remain binary game outcomes (+1/-1), which is what works best for MCTS (lesson #12: decisive > accurate).
@@ -343,20 +361,133 @@ python3 /tmp/bench_az_vs_ab.py datasets/az_v2_selfplay_rX.pt 100 6 400
 **Transition point**: ~25,000 cumulative self-play games. At 2,000 games/round, that's ~12-13 rounds. At 5,000/round, ~5 rounds.
 
 ### Success Criteria
-- **Round 1**: Any improvement over 64% vs AB confirms self-play is viable
+- **Round 1**: Any improvement over ~55% vs AB confirms self-play is viable
 - **Short-term**: Match the BBSearch expert at 72% vs AB
 - **Medium-term**: Exceed 72% (surpass the expert — the whole point of self-play)
 - **Long-term**: Reach 80%+ vs AB (approaching BBSearch depth 3's 84%)
 - **Health check**: avg_turns should stay in 70-100 range. If games get longer (>120 turns), the model is degrading.
 
-### Current Status
-- Round 1 generation in progress: 500 games, ~86 avg turns (healthy)
-- Checkpoint: `datasets/az_v2_325k_200ep.pt` (64% vs AB, exp #14)
+### 21. Self-play round 1 — fine-tune (2.07M + 40K self-play)
+- **Architecture**: Shared body (512, 256), dropout=0.1, **loaded from exp #14 weights**
+- **Params**: ~325K total
+- **Data**: 2.07M (original expert) + ~40K (500 self-play games, ~86 avg turns) = ~2.11M samples
+- **Config**: 200 epochs, lr=1e-4, cosine, batch=2048, MPS
+- **Result**: **38% vs AB (n=100, 400 sims)**
+- **Note**: Performance DEGRADED from ~55% → 38%. Re-training on data the model already converged on = overfitting (same pattern as exp #4). Fine-tuning does NOT work — must use fresh init each time.
+- **Lesson**: **Never fine-tune. Always fresh init with `--body-dims 512,256 --dropout 0.1`**
+
+### 22. Self-play round 1 — fresh init (2.07M + 40K self-play, Colab GPU)
+- **Architecture**: Shared body (512, 256), dropout=0.1, **fresh Xavier init**
+- **Params**: ~325K total
+- **Data**: Same as #21 — 2.07M expert + ~40K self-play + `az_selfplay_v2` data
+- **Config**: 200 epochs, lr=1e-4, cosine, batch=4096, **CUDA (Colab T4)**
+- **Result**: **44% vs AB (n=100, 400 sims)**
+- **Note**: ~11pp worse than exp #14 (~55%). The only difference from #14 is including the self-play data (`datasets/az_selfplay_v2`). Self-play data from a ~55% model HURTS because it's lower quality than the expert data (72% search player). Diagnostics confirm: value head overoptimism increased from 54% → 65%, late-game loss Q stayed positive (+0.148 vs -0.127). Also batch size was 4096 (vs 2048 for #14), which may affect convergence.
+- **Lesson**: **Don't add self-play data generated by a model weaker than the expert.** Self-play is only useful once the model surpasses the expert.
+
+---
+
+## Training Infrastructure
+
+### Memory Optimization
+- Original code preloaded all data to MPS as 3 copies (numpy float64 → Dataset float32 → train/val float32 split) = **~20GB** on 8GB M1
+- Fixed: cast to float32 early, convert one array at a time via `torch.from_numpy` (zero-copy) → index → `.to(device)` → delete numpy immediately
+- Result: ~5GB steady state, ~8GB peak during conversion
+
+### Resumable Training
+- `--resume-training PATH` saves checkpoint every 5 epochs (`_training.pt` file)
+- Stores: model weights, optimizer state, LR scheduler state, best val loss, epoch counter, training history
+- Auto-deleted when training completes normally
+- Ctrl+C safe: re-run same command with `--resume-training` added
+
+### Colab GPU Training
+- Notebook: `bettafish_colab.ipynb` section 3
+- Workflow: zip data locally → upload to Google Drive → Colab extracts and trains → copies result back to Drive
+- T4 GPU: ~5-8s/epoch (vs ~30s on M1 MPS)
+- Data compresses well: 2.07M samples (3.7GB raw) → ~79MB zip (96-100% deflation on .npy)
+- Batch size 4096 on GPU (vs 2048 on M1)
+
+### Key Training Rules
+1. **Always use `--body-dims 512,256 --dropout 0.1`** for fresh init — never fine-tune
+2. **Batch size**: 2048 on M1 MPS, 4096 on GPU
+3. **200 epochs with cosine LR + early stopping (patience 20)** is the standard config
+4. **n=100 for benchmarks** — n=10/20 is too noisy
+
+---
+
+## MCTS Diagnostics (Feb 2026)
+
+Instrumented `BBMCTSPlayer._simulate()` and `bb_decide()` with per-decision tracking. Analysis script: `/tmp/mcts_diagnostics.py`.
+
+### Exp #14 Profile (az_v2_325k_200ep.pt, 400 sims, n=100)
+| Metric | Value | Assessment |
+|--------|-------|------------|
+| Win rate vs AB | ~55% [49%, 61%] | Revised down from 64% |
+| Policy top-1 accuracy | ~55% | MODERATE — policy provides guidance but MCTS overrides often |
+| Policy top-3 accuracy | ~72% | OK — MCTS choice usually in prior's top 3 |
+| Value win/loss separation | +0.14 | MODERATE — some signal but noisy |
+| Value overoptimism | 54% | CONCERNING — Q > 0 in majority of lost-game decisions |
+| Avg sim depth | ~6.5 | OK for ~10 avg legal actions |
+| Visit top-1 fraction | ~55% | MODERATE — reasonably focused |
+| Q-value spread | 0.15 | OK — differentiates between moves |
+| Action coverage | ~97% (10.4 avg actions) | Expected with 400 sims and small action space |
+
+### Exp #22 Profile (az_v2_selfplay_r1.pt, 400 sims) — Comparison
+Self-play data damaged the value head, not the policy:
+| Metric | Exp #14 | Exp #22 | Delta |
+|--------|---------|---------|-------|
+| Win rate | ~55% | ~44% | -11pp |
+| Policy top-1 accuracy | ~55% | ~54% | ≈same |
+| Value overoptimism | 54% | 65% | +11pp (worse) |
+| Late-game loss Q | -0.127 | +0.148 | Doesn't go negative! |
+| Win/loss separation | +0.14 | +0.08 | Weaker signal |
+
+**Diagnosis**: The self-play data taught the value head to be more optimistic (never admitting it's losing), which cripples MCTS's ability to avoid losing lines.
+
+## Current Status & Path Forward
+
+### Where We Are
+- **Best MCTS model**: ~55% vs AB (exp #14, 400 sims, az_v2_325k_200ep.pt)
+- **Best search player**: 72% vs AB (BBSearch depth 2, blend 1e8)
+- **Gap**: ~17pp — much larger than originally thought
+- **Primary bottleneck**: Value head overoptimism (doesn't recognize losing positions)
+- **Self-play data hurts** when generated by a model weaker than the expert (exp #22)
+- **Fine-tuning always hurts** — must use fresh init (exp #4, #15, #21)
+
+### The Expert Ceiling Problem
+Training on expert data (one-hot policy targets from 72% search player):
+- **Policy head** is capped at expert quality — it can only imitate what the expert does
+- **Value head** trains on game outcomes (+1/-1), but at ~55% the model is too weak for self-play to help
+- **MCTS can amplify** a good network beyond expert quality — 400 sims searches depth 10-20
+- **But** the model needs to be close enough (~70%+) for self-play data to match expert quality
+- At ~55%, the gap to self-play viability is larger than previously estimated (~15pp, not ~6pp)
+
+### Key Insight: Value Head Is the Bottleneck
+The diagnostics clearly identify the value head as the ceiling. The policy is adequate (~55% top-1 accuracy, ~72% top-3), search depth is reasonable (~6.5), but the value head:
+1. **Stays positive during losses** (54% overoptimism) — MCTS doesn't defend
+2. **Weak separation** (+0.14 gap) — hard to distinguish winning from losing trees
+3. **Adding self-play data makes it worse** — more optimistic, less calibrated
+
+### Realistic Next Steps
+1. **Fix the value head** — the current value targets are binary (+1/-1 game outcomes). The value head may need:
+   - Asymmetric loss weighting (penalize overoptimism in losses more)
+   - Auxiliary targets (VP differential, resource advantage) alongside win/loss
+   - Temperature-scaled targets (discount early-game outcomes, weight endgame)
+   - Hard negative mining (oversample positions from lost games)
+2. **More expert data at depth 3** — higher quality targets, especially for losing positions where the expert was forced into bad states
+3. **Architecture changes** — separate value body may help the value head specialize on loss detection
+4. **Hybrid approach** — use BBSearch for opening (where heuristic dominates) and MCTS for midgame/endgame
+
+### What Probably Won't Help
+- More MCTS sims (400 = 800, confirmed)
+- Self-play data at current strength (exp #22 shows it hurts)
+- Fine-tuning existing checkpoint (always degrades)
+- Value distillation from blend function (exp #15, #19 show it hurts)
 
 ## Open Questions
-- Why does the BC net (trained on human games, weaker standalone) outperform the AZ net as a search tiebreaker? Is it the sigmoid vs tanh output range? The training data distribution? The blend weight (1e8 tuned for BC's [0, 0.18] range; AZ outputs [0, 1], so effective weight is ~5x higher)?
-- Would more MCTS sims (1600, 3200) eventually close the gap with search, or is the algorithm fundamentally worse for Catan?
-- Could a hybrid minimax+MCTS approach work? E.g., use minimax for the first 2 plies then MCTS for deeper exploration?
-- Is the path forward improving the search player (better neural tiebreaker, deeper search, better pruning) rather than MCTS?
-- At what point during self-play training should we re-evaluate the blend weight for using the AZ net as a tiebreaker in the search player?
-- Should we increase MCTS sims (800, 1600) for self-play generation even if it doesn't help at inference? Deeper search during generation = higher quality training data.
+- Can asymmetric loss weighting fix the overoptimism problem?
+- Would training the value head with VP-differential auxiliary targets improve calibration?
+- Is the policy's ~55% top-1 accuracy actually good enough, or do we need better policy too?
+- Could curriculum learning (easy positions → hard positions) help the value head learn loss detection?
+- Would a separate value body (split architecture, exp #10-#13) help if combined with overoptimism fixes?
+- Is the path forward improving the search player (better neural tiebreaker) rather than MCTS?

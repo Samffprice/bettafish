@@ -181,6 +181,11 @@ class BBMCTSPlayer(Player):
         self.leaf_value_fn = leaf_value_fn
         self.leaf_use_policy = leaf_use_policy
 
+        # Diagnostics
+        self.diagnostics = False
+        self._diag_records = []       # per-decision stats
+        self._diag_sim_depths = []    # per-simulation depths within current search
+
         # Pre-allocate buffers
         self._feat_buf = np.zeros(self.n_features, dtype=np.float32)
         self._feat_tensor = torch.zeros(1, self.n_features, dtype=torch.float32)
@@ -190,6 +195,10 @@ class BBMCTSPlayer(Player):
     def decide(self, game, playable_actions):
         if len(playable_actions) == 1:
             return playable_actions[0]
+
+        # Sync FeatureIndexer with this game's map (production features
+        # depend on tile/number layout which changes per game).
+        self.fi.update_map(game.state.board.map)
 
         bb_state = game_to_bitboard(game)
         return self.bb_decide(bb_state, playable_actions)
@@ -212,6 +221,38 @@ class BBMCTSPlayer(Player):
                 break
             self._simulate(root)
 
+        # Record diagnostics before action selection
+        if self.diagnostics and isinstance(root.children, list) and len(root.children) > 0:
+            visit_dist = root.visit_distribution()
+            total_visits = sum(visit_dist.values())
+            if total_visits > 0:
+                priors = {a: c.prior for a, c in root.children}
+                q_values = {a: c.q_value for a, c in root.children if c.visit_count > 0}
+                top1_visits = max(visit_dist.values()) / total_visits
+                actions_with_visits = sum(1 for v in visit_dist.values() if v > 0)
+
+                # Q-value spread
+                if q_values:
+                    q_vals = list(q_values.values())
+                    q_spread = max(q_vals) - min(q_vals)
+                else:
+                    q_spread = 0.0
+
+                self._diag_records.append({
+                    'num_actions': len(visit_dist),
+                    'total_visits': total_visits,
+                    'visit_dist': dict(visit_dist),
+                    'priors': dict(priors),
+                    'q_values': dict(q_values),
+                    'value_at_root': root.q_value,
+                    'avg_sim_depth': float(np.mean(self._diag_sim_depths)) if self._diag_sim_depths else 0.0,
+                    'max_sim_depth': max(self._diag_sim_depths) if self._diag_sim_depths else 0,
+                    'top1_visits': top1_visits,
+                    'actions_with_visits': actions_with_visits,
+                    'q_spread': q_spread,
+                })
+            self._diag_sim_depths = []
+
         # Select action
         if self.temperature <= 0:
             # Greedy: most visited
@@ -229,6 +270,7 @@ class BBMCTSPlayer(Player):
     def _simulate(self, root):
         """One MCTS simulation: select → materialize → evaluate → expand → backprop."""
         node = root
+        depth = 0
 
         # SELECT
         while node.is_expanded and not node.is_terminal:
@@ -236,6 +278,7 @@ class BBMCTSPlayer(Player):
                 node = self._select_chance(node)
             else:
                 _, node = node.best_child(self.c_puct)
+            depth += 1
 
         # MATERIALIZE
         if node.bb_state is None:
@@ -247,6 +290,7 @@ class BBMCTSPlayer(Player):
             node.is_expanded = True
             # Sample through the chance node to get a decision leaf
             node = self._select_chance(node)
+            depth += 1
             if node.bb_state is None:
                 node.materialize()
 
@@ -259,6 +303,9 @@ class BBMCTSPlayer(Player):
 
         # BACKPROPAGATE
         self._backpropagate(node, value)
+
+        if self.diagnostics:
+            self._diag_sim_depths.append(depth)
 
     def _evaluate_and_expand(self, node, actions):
         """Evaluate leaf with neural net and expand children with policy priors.
