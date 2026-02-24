@@ -1454,9 +1454,11 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
     global_feat_stds = global_features.std(axis=0).astype(np.float32)
     global_feat_stds[global_feat_stds < 1e-6] = 1.0
 
-    # Normalize in-place
-    node_features = (node_features - node_feat_means) / node_feat_stds
-    global_features = (global_features - global_feat_means) / global_feat_stds
+    # Normalize truly in-place (no temporary copy)
+    node_features -= node_feat_means
+    node_features /= node_feat_stds
+    global_features -= global_feat_means
+    global_features /= global_feat_stds
 
     # Create fresh GNN
     net = CatanGNNet(
@@ -1490,29 +1492,61 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
     # Determine data placement: GPU (fast) or CPU (low memory)
     data_device = device if (gpu_data and device.type in ('cuda', 'mps')) else torch.device('cpu')
 
-    train_nf = torch.from_numpy(node_features[train_idx]).to(data_device)
-    val_nf = torch.from_numpy(node_features[val_idx]).to(data_device)
-    del node_features; gc.collect()
+    if gpu_data and data_device.type != 'cpu':
+        # GPU mode: move full array to GPU, split there, free immediately.
+        # Peak GPU: full_array + train_split (before full_array is freed)
+        # For node_features: 9.8 GB + 8.8 GB = 18.6 GB peak, then settles to ~10 GB
+        tidx_gpu = torch.tensor(train_idx, device=data_device, dtype=torch.long)
+        vidx_gpu = torch.tensor(val_idx, device=data_device, dtype=torch.long)
+        del train_idx, val_idx
 
-    train_gf = torch.from_numpy(global_features[train_idx]).to(data_device)
-    val_gf = torch.from_numpy(global_features[val_idx]).to(data_device)
-    del global_features; gc.collect()
+        # Node features (largest — do first while GPU is empty)
+        t = torch.from_numpy(node_features).to(data_device)
+        del node_features; gc.collect()
+        train_nf = t[tidx_gpu]; val_nf = t[vidx_gpu]
+        del t; torch.cuda.empty_cache(); gc.collect()
 
-    train_val = torch.from_numpy(values[train_idx]).to(data_device)
-    val_val = torch.from_numpy(values[val_idx]).to(data_device)
-    del values; gc.collect()
+        t = torch.from_numpy(global_features).to(data_device)
+        del global_features; gc.collect()
+        train_gf = t[tidx_gpu]; val_gf = t[vidx_gpu]
+        del t; torch.cuda.empty_cache(); gc.collect()
 
-    if policies is not None:
-        train_pol = torch.from_numpy(policies[train_idx]).to(data_device)
-        val_pol = torch.from_numpy(policies[val_idx]).to(data_device)
-        del policies; gc.collect()
+        t = torch.from_numpy(values).to(data_device)
+        del values; gc.collect()
+        train_val = t[tidx_gpu]; val_val = t[vidx_gpu]
+        del t; torch.cuda.empty_cache(); gc.collect()
+
+        if policies is not None:
+            t = torch.from_numpy(policies).to(data_device)
+            del policies; gc.collect()
+            train_pol = t[tidx_gpu]; val_pol = t[vidx_gpu]
+            del t; torch.cuda.empty_cache(); gc.collect()
+        else:
+            train_pol = None; val_pol = None
+
+        del tidx_gpu, vidx_gpu; torch.cuda.empty_cache(); gc.collect()
     else:
-        train_pol = None
-        val_pol = None
+        # CPU mode: index numpy first (cheap view/copy), wrap as tensor
+        train_nf = torch.from_numpy(node_features[train_idx])
+        val_nf = torch.from_numpy(node_features[val_idx])
+        del node_features; gc.collect()
 
-    del train_idx, val_idx; gc.collect()
-    if data_device.type != 'cpu':
-        torch.cuda.empty_cache() if data_device.type == 'cuda' else None
+        train_gf = torch.from_numpy(global_features[train_idx])
+        val_gf = torch.from_numpy(global_features[val_idx])
+        del global_features; gc.collect()
+
+        train_val = torch.from_numpy(values[train_idx])
+        val_val = torch.from_numpy(values[val_idx])
+        del values; gc.collect()
+
+        if policies is not None:
+            train_pol = torch.from_numpy(policies[train_idx])
+            val_pol = torch.from_numpy(policies[val_idx])
+            del policies; gc.collect()
+        else:
+            train_pol = None; val_pol = None
+
+        del train_idx, val_idx; gc.collect()
 
     data_loc = "GPU" if data_device.type != 'cpu' else "CPU"
     print(f"  {n_train:,} train + {n_val:,} val samples (data on {data_loc})")
