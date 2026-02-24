@@ -845,6 +845,62 @@ def make_bb_az_blended_value_fn(az_path, blend_weight=1e10):
     return value_fn
 
 
+def make_bb_gnn_blended_value_fn(gnn_path, blend_weight=1e10):
+    """Create a blended value function using a GNN checkpoint's value head.
+
+    Like make_bb_az_blended_value_fn but loads CatanGNNet instead of CatanAlphaZeroNet.
+    The GNN value head outputs tanh [-1, +1], rescaled to [0, 1] for blend compatibility.
+    """
+    from robottler.gnn_net import (
+        CatanGNNet, NODE_FEAT_DIM, GLOBAL_FEAT_DIM,
+        bb_fill_node_features, bb_fill_global_features,
+        load_checkpoint_gnn,
+    )
+    from robottler.bitboard.features import _build_node_prod
+
+    net, ckpt = load_checkpoint_gnn(gnn_path)
+    net.eval()
+
+    node_means = np.asarray(ckpt['node_feat_means'], dtype=np.float32)
+    node_stds = np.asarray(ckpt['node_feat_stds'], dtype=np.float32)
+    global_means = np.asarray(ckpt['global_feat_means'], dtype=np.float32)
+    global_stds = np.asarray(ckpt['global_feat_stds'], dtype=np.float32)
+
+    node_buf = np.zeros((54, NODE_FEAT_DIM), dtype=np.float32)
+    global_buf = np.zeros(GLOBAL_FEAT_DIM, dtype=np.float32)
+    node_prod = None
+    cached_map = None
+
+    def value_fn(bb_state, p0_color):
+        nonlocal node_prod, cached_map
+        if bb_state.catan_map is not cached_map:
+            cached_map = bb_state.catan_map
+            node_prod = _build_node_prod(cached_map)
+
+        # GNN neural eval
+        node_buf[:] = 0.0
+        global_buf[:] = 0.0
+        bb_fill_node_features(bb_state, p0_color, node_buf, node_prod)
+        bb_fill_global_features(bb_state, p0_color, global_buf)
+
+        # Normalize
+        nf = (node_buf - node_means) / node_stds
+        gf = (global_buf - global_means) / global_stds
+
+        nt = torch.from_numpy(nf).unsqueeze(0)
+        gt = torch.from_numpy(gf).unsqueeze(0).float()
+        with torch.inference_mode():
+            v, _ = net.forward(nt, gt)
+            n = (v.item() + 1.0) / 2.0  # tanh [-1,+1] -> [0,1]
+
+        # Heuristic eval
+        h = _bb_heuristic(bb_state, p0_color, node_prod)
+
+        return h + blend_weight * n
+
+    return value_fn
+
+
 class BitboardSearchPlayer(NeuralSearchPlayer):
     """AlphaBeta search using bitboard state for fast copy/apply/movegen.
 

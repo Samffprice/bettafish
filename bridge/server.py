@@ -1838,7 +1838,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AICatan bridge server")
     parser.add_argument("--no-anticheat", action="store_true", help="Disable anti-cheat delays")
     parser.add_argument("--bot", type=str, default="search",
-                        choices=["search", "value", "neural", "random"],
+                        choices=["search", "value", "neural", "mcts", "random"],
                         help="Bot type (default: search)")
     parser.add_argument("--search-depth", type=int, default=3,
                         help="Search depth for search bot (default: 3)")

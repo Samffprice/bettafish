@@ -222,6 +222,7 @@ Investigated what makes the blend function work. The blend is `heuristic + 1e8 *
 | 23a | Asymmetric loss 3x | Shared | 2.07M d2+d3 | 200 | — | — | 59% (100) |
 | 23b | Neg oversample 60% | Shared | 2.07M d2+d3 | 200 | — | — | 59% (100) |
 | 23c | Asym 3x + neg 60% | Shared | 2.07M d2+d3 | 200 | — | — | 51% (100) |
+| 25 | Depth-1 leaf search | — | — | — | — | — | 18-66% (50) |
 
 ### Search Player Blend Decomposition
 | # | Eval Mode | Neural Source | vs AB (n) | Delta vs heuristic |
@@ -248,12 +249,51 @@ Note: "bench" uses `bench_az_vs_ab.py` (no Dirichlet, 6 workers); "diag" uses `m
 - **Lesson**: Improving value calibration metrics doesn't translate to better play. Better win/loss separation ≠ better MCTS decisions. The value head's overoptimism was a symptom, not the cause of the ~55% ceiling.
 - **Shallower trees** (avg depth 4.4-4.5 vs 6.5): stronger value signal causes MCTS to converge faster and explore less, which may be detrimental in stochastic Catan where exploration is valuable.
 
+### 24a-c. Ranking Loss (MarginRankingLoss on Expert Action Orderings)
+- **Architecture**: Shared body, v2 (512,256), fresh init, dropout 0.1
+- **Data**: 2.07M (same as exp #14) + ranking data from 1000 expert games (108K positions, 1.1M child states)
+- **Config**: 200 epochs, lr=1e-3, cosine, batch=16384 (GPU), ranking_weight=1.0
+- **Ranking data**: At each decision point, all legal child states evaluated with blend fn (heuristic + 1e8 * neural). CSR-format storage. MarginRankingLoss on all (better, worse) pairs per position.
+
+| Variant | Margin | Tau | Top-1 | MCTS=Expert | vs AB (100) |
+|---------|--------|-----|-------|-------------|-------------|
+| 24a | 0.1 (conservative) | **+0.557** | **53%** | **67%** | **56%** |
+| 24b | 0.3 (moderate) | **+0.567** | **53%** | 60% | 44% |
+| 24c | 0.5 (aggressive) | +0.436 | 40% | 47% | 43% |
+| baseline (#14) | — | +0.44 | 45% | 53% | ~55% |
+
+- **Key finding**: Ranking loss successfully improves tau (+0.12 at margin 0.1 and 0.3) and top-1 agreement (+8pp), but **does NOT improve win rate**. Margin 0.1 is within noise of baseline (56% ≈ 55%), margins 0.3 and 0.5 actively hurt.
+- **The paradox**: Higher margin forces wider value gaps between better/worse moves, which improves ranking metrics but distorts the value landscape. At margin 0.3+, the ranking loss overpowers MSE and the network outputs values optimized for ordering rather than accuracy — hurting MCTS which needs both.
+- **Margin 0.5 regressed tau to baseline** — the aggressive margin made training unstable, losing both ranking and calibration.
+- **Lesson**: Improving ranking (tau) through auxiliary losses doesn't translate to better MCTS play, just as improving calibration (exp #23) didn't. The ~55% ceiling appears fundamental to this architecture + search combination, not a training objective problem.
+
 ### MCTS Hybrid (AZ policy + external value)
 | # | Leaf Value Source | vs AB (n) | Notes |
 |---|-------------------|-----------|-------|
 | 14 | AZ value head (pure) | ~55% (600) | baseline MCTS (revised) |
 | 19 | blend_leaf (normalized blend) | ~58% (2×50) | similar to baseline — compressed range |
 | 20 | pure heuristic (tanh/1e14) | 8% (50) | broken normalization — all values ≈ 1.0 |
+| 25 | depth-1 neural (max child AZ val) | 60% (50) | slower (9.5s/game), no improvement |
+| 25 | depth-1 heuristic_select (heuristic picks best child, AZ evaluates it) | 66% (50) | 6.3s/game, within noise of baseline |
+| 25 | depth-1 heuristic_rank (rank-normalize to [-1,+1]) | 18% (50) | rank normalization destroys signal |
+
+### 25. Depth-1 Search at MCTS Leaves
+- **Player**: BBMCTSPlayer 400 sims, c_puct=1.4, AZ v2 policy priors, no Dirichlet noise
+- **Idea**: Instead of evaluating the leaf position with the AZ value head, do 1-ply minimax: generate all legal child actions, apply each, evaluate children, take max (our turn) or min (opponent turn). Three modes tested:
+  - **neural**: AZ net evaluates each child, take max/min
+  - **heuristic_select**: heuristic ranks children to pick the best, AZ net evaluates that child (avoids normalization problem)
+  - **heuristic_rank**: heuristic evaluates all children, rank-normalize best to +1, worst to -1
+
+| Mode | vs AB (n=50) | Time/game | Notes |
+|------|-------------|-----------|-------|
+| baseline (no depth-1) | 70% | 3.9s | control (same seeds, same run) |
+| neural | 60% | 9.5s | ~15x slower per leaf, no benefit |
+| heuristic_select | 66% | 6.3s | within noise of baseline |
+| heuristic_rank | **18%** | 3.3s | catastrophic — rank normalization loses absolute quality info |
+
+- **Note**: Baseline scored 70% in this run (vs historical ~55%) due to seed selection (sequential 0-49); relative comparison is what matters.
+- **Why it failed**: MCTS already explores children of each leaf through its own tree expansion on subsequent simulations. Depth-1 at leaves spends 10-15x more compute per leaf to get information MCTS would discover naturally. Taking max(child_values) systematically inflates values toward +1 (neural mode) or destroys absolute quality information (heuristic_rank mode). The heuristic_select mode avoids both pitfalls but still doesn't help — the heuristic and neural net may disagree on "best child", introducing noise rather than signal.
+- **Lesson**: The MCTS leaf evaluation problem cannot be solved by adding search at the leaves. MCTS IS the search — duplicating it at leaves is redundant at best and harmful at worst.
 
 ## Key Lessons
 
@@ -292,6 +332,7 @@ Note: "bench" uses `bench_az_vs_ab.py` (no Dirichlet, 6 workers); "diag" uses `m
 26. **Better diagnostics ≠ better play** — exp #23c improved value calibration dramatically (Q-gap 3.4x, overoptimism -11pp, policy accuracy +20pp) but won fewer games (51% vs ~55%). Fixing measured bottlenecks doesn't guarantee performance gains. The value head's overoptimism may be a symptom, not a cause.
 27. **Asymmetric loss / negative oversampling don't help** — neither individually (23a/b: 59%) nor combined (23c: 51%) beat baseline. Overcorrecting the value head may make MCTS too conservative and reduce beneficial exploration.
 28. **Calibration ≠ ranking** — exp #23a improved all calibration metrics (Q-gap 5x, overoptimism -19pp) but WORSENED move ranking (Kendall tau +0.28 vs +0.44, top-1 agreement 25% vs 45%). The value head can predict game outcomes better while being worse at discriminating between individual moves. MCTS needs ranking, not calibration.
+29. **Ranking loss improves tau but not play** — exp #24a improved Kendall tau from +0.44 to +0.557 and top-1 from 45% to 53%, but win rate unchanged (56% ≈ 55%). This combined with lesson #26 (calibration doesn't help either) suggests the ~55% MCTS ceiling is not a training objective problem. The limitation is architectural — a 325K-param MLP doing 1-ply neural evaluation cannot match depth-2 alpha-beta search with a hand-crafted heuristic, regardless of how it's trained.
 
 ## The Core Problem
 
@@ -308,7 +349,7 @@ Asymmetric loss + negative oversampling **dramatically improved all diagnostic m
 - Overoptimism: 54% → 43%, Q-gap: 0.14 → 0.475, Policy accuracy: 55% → 76%
 - But win rate **did not improve** (51% vs ~55% baseline)
 
-**The value head's overoptimism was a symptom, not the cause.** Fixing it didn't fix the player. This means the ~55% ceiling is likely set by something diagnostics don't capture — possibly Catan's inherent stochasticity at this simulation budget, the quality ceiling of the expert data, or architectural limitations of the shared-body network.
+**The ~55% ceiling is not a training objective problem.** We've now tried fixing calibration (exp #23), ranking (exp #24), value distillation (exp #15), and self-play (exp #22) — none improved MCTS play. The limitation is likely **architectural**: a 325K-param MLP evaluating leaf states cannot match depth-2 alpha-beta search with a hand-crafted heuristic. MCTS with a weak value function is effectively doing 1-ply evaluation with stochastic tree noise, while BBSearch literally searches 2 plies deep with pruning. The path forward is either (a) making the search player faster (depth 3 = 84% vs AB) or (b) a fundamentally different approach to handling Catan's stochasticity.
 
 ### What We've Ruled Out
 - More sims (400 = 800, confirmed)
@@ -316,7 +357,8 @@ Asymmetric loss + negative oversampling **dramatically improved all diagnostic m
 - Blend-leaf hybrid (exp #19: no help)
 - Self-play data from weak model (exp #22: hurt)
 - Fine-tuning (always degrades)
-- **Asymmetric loss / negative oversampling (exp #23: no help despite better diagnostics)**
+- Asymmetric loss / negative oversampling (exp #23: no help despite better calibration)
+- **Ranking loss / MarginRankingLoss (exp #24: improved tau +0.12 but no win rate gain)**
 
 MCTS (~55%) vs BBSearch direct matchup = 38% (n=50), meaning MCTS is closer to BBSearch head-to-head than the AB benchmark suggests.
 
@@ -604,14 +646,13 @@ Why the MLP can't rank well:
 
 3. **Distill expert rankings into policy head** — Instead of training the value head to rank (hard), train the policy head with soft targets from expert search (probability proportional to expert action values). The policy head already achieves 55% top-1 accuracy; explicit ranking supervision could push this higher.
 
-4. **Hybrid: expert-guided MCTS** — Use expert depth-1 evaluations as MCTS leaf values (replacing AZ value head). The expert's per-move values are already well-calibrated for ranking. This would let MCTS do deep search guided by expert-quality evaluation.
-
 ### What Won't Help (Confirmed)
 - More MCTS sims (search converges by sim 65)
 - Value calibration fixes (calibration ≠ ranking)
 - Dice handling changes (no signal compression)
 - Self-play from sub-expert model
 - Fine-tuning existing checkpoints
+- Depth-1 search at MCTS leaves (exp #25: redundant with MCTS's own tree expansion)
 
 ## Open Questions
 - Would a pairwise ranking loss (trained on expert move orderings) break through the tau = 0.44 ceiling?

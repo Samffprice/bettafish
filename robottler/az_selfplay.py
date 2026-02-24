@@ -82,6 +82,11 @@ from robottler.bb_mcts_player import BBMCTSPlayer, BBMCTSNode, make_bb_mcts_play
 from robottler.bitboard.convert import game_to_bitboard
 from robottler.bitboard.features import FeatureIndexer, bb_fill_feature_vector
 from robottler.bitboard.movegen import bb_generate_actions
+from robottler.gnn_net import (
+    CatanGNNet, NODE_FEAT_DIM, GLOBAL_FEAT_DIM,
+    bb_fill_node_features, bb_fill_global_features,
+    save_checkpoint_gnn, load_checkpoint_gnn,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +470,8 @@ def generate_one_game_v2(az_net, feature_indexer, feature_means, feature_stds,
 
 def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, feature_stds,
                              search_depth=2, dice_sample_size=5, vps_to_win=10,
-                             blend_leaf_fn=None, with_ranking=False):
+                             blend_leaf_fn=None, with_ranking=False,
+                             with_graph_features=False):
     """Play one game with BitboardSearchPlayer (both sides) for ExIt training.
 
     Records:
@@ -473,6 +479,7 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
     - One-hot policy target: the search player's chosen action
     - Value target: continuous blend evaluation (if blend_leaf_fn provided),
       or binary +1/-1 game outcome (fallback)
+    - Optionally: per-node features [54, 18] and global features [76] for GNN
 
     Args:
         bb_value_fn: Bitboard value function (from make_bb_blended_value_fn)
@@ -486,6 +493,8 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
             instead of binary game outcome. Use make_blend_leaf_fn() to create.
         with_ranking: If True, evaluate all legal child states with bb_value_fn
             at each decision point and return per-action scores for ranking loss.
+        with_graph_features: If True, also extract per-node [54, 18] and
+            global [76] features at each decision point for GNN training.
 
     Returns:
         records: list of SelfPlayRecord
@@ -493,6 +502,8 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
         num_turns: int
         ranking_records: list of (child_features, child_scores) tuples
             Only returned when with_ranking=True, otherwise omitted.
+        graph_features: list of (node_features[54,18], global_features[76]) tuples
+            Only returned when with_graph_features=True, otherwise omitted.
     """
     from robottler.search_player import BitboardSearchPlayer
 
@@ -516,7 +527,12 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
 
     raw_records = []  # (features, policy_target, color, value_target_or_None)
     ranking_records = []  # (child_features_array, child_scores_array)
+    graph_records = []  # (node_features[54,18], global_features[76])
     feat_buf = np.zeros(n_features, dtype=np.float32)
+    if with_graph_features:
+        node_buf = np.zeros((54, NODE_FEAT_DIM), dtype=np.float32)
+        global_buf = np.zeros(GLOBAL_FEAT_DIM, dtype=np.float32)
+        node_prod = feature_indexer.node_prod
 
     while game.winning_color() is None and game.state.num_turns < 1000:
         actions = game.playable_actions
@@ -534,6 +550,13 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
         bb_state = game_to_bitboard(game)
         feat_buf[:] = 0.0
         bb_fill_feature_vector(bb_state, current.color, feat_buf, feature_indexer)
+
+        # Extract graph features if requested
+        if with_graph_features:
+            node_buf[:] = 0.0
+            global_buf[:] = 0.0
+            bb_fill_node_features(bb_state, current.color, node_buf, node_prod)
+            bb_fill_global_features(bb_state, current.color, global_buf)
 
         # Compute blend value target if available
         blend_value = None
@@ -577,6 +600,8 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
             continue
 
         raw_records.append((feat_buf.copy(), policy_target, current.color, blend_value))
+        if with_graph_features:
+            graph_records.append((node_buf.copy(), global_buf.copy()))
         game.execute(chosen)
 
     winner = game.winning_color()
@@ -595,9 +620,12 @@ def generate_one_game_expert(bb_value_fn, feature_indexer, feature_means, featur
             value_target = -1.0
         records.append(SelfPlayRecord(features, policy_target, value_target))
 
+    result = [records, winner, game.state.num_turns]
     if with_ranking:
-        return records, winner, game.state.num_turns, ranking_records
-    return records, winner, game.state.num_turns
+        result.append(ranking_records)
+    if with_graph_features:
+        result.append(graph_records)
+    return tuple(result)
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +641,8 @@ _expert_worker_blend_leaf_fn = None
 
 
 def _expert_worker_init(bc_path, blend_weight, search_depth, dice_sample_size,
-                         vps_to_win, distill_values, with_ranking=False):
+                         vps_to_win, distill_values, with_ranking=False,
+                         with_graph_features=False):
     """Initialize per-worker state for expert iteration: load blend value fn."""
     global _expert_worker_value_fn, _expert_worker_fi
     global _expert_worker_means, _expert_worker_stds, _expert_worker_kwargs
@@ -644,42 +673,50 @@ def _expert_worker_init(bc_path, blend_weight, search_depth, dice_sample_size,
         'dice_sample_size': dice_sample_size,
         'vps_to_win': vps_to_win,
         'with_ranking': with_ranking,
+        'with_graph_features': with_graph_features,
     }
 
 
 def _expert_worker_play_one(_game_idx):
     """Play one expert game in a worker."""
     with_ranking = _expert_worker_kwargs.get('with_ranking', False)
+    with_graph_features = _expert_worker_kwargs.get('with_graph_features', False)
+    result = generate_one_game_expert(
+        _expert_worker_value_fn, _expert_worker_fi,
+        _expert_worker_means, _expert_worker_stds,
+        blend_leaf_fn=_expert_worker_blend_leaf_fn,
+        **_expert_worker_kwargs,
+    )
+    # Unpack variable-length result tuple
+    records, winner, turns = result[0], result[1], result[2]
+    idx = 3
     if with_ranking:
-        records, winner, turns, ranking_records = generate_one_game_expert(
-            _expert_worker_value_fn, _expert_worker_fi,
-            _expert_worker_means, _expert_worker_stds,
-            blend_leaf_fn=_expert_worker_blend_leaf_fn,
-            **_expert_worker_kwargs,
-        )
+        ranking_records = result[idx]; idx += 1
     else:
-        records, winner, turns = generate_one_game_expert(
-            _expert_worker_value_fn, _expert_worker_fi,
-            _expert_worker_means, _expert_worker_stds,
-            blend_leaf_fn=_expert_worker_blend_leaf_fn,
-            **_expert_worker_kwargs,
-        )
         ranking_records = []
+    if with_graph_features:
+        graph_records = result[idx]; idx += 1
+    else:
+        graph_records = []
     features = [r.features for r in records]
     policies = [r.policy_target for r in records]
     values = [r.value_target for r in records]
     # Serialize ranking records as lists for pickling
     ranking_serial = [(cf.tolist(), cs.tolist()) for cf, cs in ranking_records]
-    return (features, policies, values, str(winner), turns, ranking_serial)
+    # Serialize graph features as lists for pickling
+    graph_serial = [(nf.tolist(), gf.tolist()) for nf, gf in graph_records]
+    return (features, policies, values, str(winner), turns, ranking_serial, graph_serial)
 
 
 def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5,
                           blend_weight=1e10, vps_to_win=10, output_dir=None,
-                          workers=1, distill_values=False, with_ranking=False):
+                          workers=1, distill_values=False, with_ranking=False,
+                          with_graph_features=False):
     """Generate expert iteration data using BitboardSearchPlayer.
 
     Same output format as generate_games() (features.npy, policies.npy, values.npy)
-    so training code works unchanged.
+    so training code works unchanged. With --with-graph-features, also saves
+    node_features.npy [N, 54, 18] and global_features.npy [N, 76] for GNN training.
 
     Args:
         bc_path: Path to BC value net (e.g., value_net_v2.pt) for blend value fn
@@ -691,6 +728,8 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
         output_dir: Directory to save data (with resume support)
         workers: Number of parallel worker processes
         with_ranking: If True, also generate ranking data (per-action expert scores)
+        with_graph_features: If True, also extract per-node [54, 18] and
+            global [76] features at each decision point for GNN training.
 
     Returns:
         all_records: list of SelfPlayRecord
@@ -742,6 +781,19 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
     remaining = num_games - start_game
 
     all_ranking_records = []
+    all_node_features = []  # list of [54, 18] arrays
+    all_global_features = []  # list of [76] arrays
+
+    # Resume graph features from previous progress
+    if with_graph_features and start_game > 0 and output_dir is not None:
+        nf_path = os.path.join(output_dir, 'node_features.npy')
+        gf_path = os.path.join(output_dir, 'global_features.npy')
+        if os.path.exists(nf_path) and os.path.exists(gf_path):
+            prev_nf, prev_gf = load_graph_records(output_dir)
+            all_node_features = list(prev_nf)
+            all_global_features = list(prev_gf)
+            print(f"  Resumed {len(all_node_features)} graph feature records")
+            del prev_nf, prev_gf
 
     if workers <= 1:
         # Sequential path
@@ -760,30 +812,33 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
 
         for i in tqdm(range(start_game, num_games), desc="Expert games",
                       initial=start_game, total=num_games):
+            result = generate_one_game_expert(
+                bb_value_fn, fi, feat_means, feat_stds,
+                search_depth=search_depth,
+                dice_sample_size=dice_sample_size,
+                vps_to_win=vps_to_win,
+                blend_leaf_fn=seq_blend_leaf_fn,
+                with_ranking=with_ranking,
+                with_graph_features=with_graph_features,
+            )
+            records, winner, turns = result[0], result[1], result[2]
+            idx = 3
             if with_ranking:
-                records, winner, turns, ranking_recs = generate_one_game_expert(
-                    bb_value_fn, fi, feat_means, feat_stds,
-                    search_depth=search_depth,
-                    dice_sample_size=dice_sample_size,
-                    vps_to_win=vps_to_win,
-                    blend_leaf_fn=seq_blend_leaf_fn,
-                    with_ranking=True,
-                )
-                all_ranking_records.extend(ranking_recs)
-            else:
-                records, winner, turns = generate_one_game_expert(
-                    bb_value_fn, fi, feat_means, feat_stds,
-                    search_depth=search_depth,
-                    dice_sample_size=dice_sample_size,
-                    vps_to_win=vps_to_win,
-                    blend_leaf_fn=seq_blend_leaf_fn,
-                )
+                all_ranking_records.extend(result[idx]); idx += 1
+            if with_graph_features:
+                graph_recs = result[idx]; idx += 1
+                for nf, gf in graph_recs:
+                    all_node_features.append(nf)
+                    all_global_features.append(gf)
+
             all_records.extend(records)
             total_turns += turns
             winners[winner] = winners.get(winner, 0) + 1
 
             if output_dir is not None:
                 save_records(all_records, output_dir, quiet=True)
+                if with_graph_features and all_node_features:
+                    _save_graph_features(all_node_features, all_global_features, output_dir)
                 with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
                     json.dump({
                         'games_completed': i + 1,
@@ -800,18 +855,20 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
             print(f"  Value distillation enabled (blend leaf fn)")
         if with_ranking:
             print(f"  Ranking data generation enabled")
+        if with_graph_features:
+            print(f"  Graph feature extraction enabled (for GNN training)")
         games_done = start_game
         with mp.Pool(
             processes=workers,
             initializer=_expert_worker_init,
             initargs=(bc_path, blend_weight, search_depth, dice_sample_size,
-                      vps_to_win, distill_values, with_ranking),
+                      vps_to_win, distill_values, with_ranking, with_graph_features),
         ) as pool:
             for result in tqdm(
                 pool.imap_unordered(_expert_worker_play_one, range(remaining)),
                 total=remaining, desc="Expert games", initial=start_game,
             ):
-                features_list, policies_list, values_list, winner_str, turns, ranking_serial = result
+                features_list, policies_list, values_list, winner_str, turns, ranking_serial, graph_serial = result
                 for feat, pol, val in zip(features_list, policies_list, values_list):
                     all_records.append(SelfPlayRecord(feat, pol, val))
                 # Deserialize ranking records
@@ -820,6 +877,10 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
                         np.array(cf_list, dtype=np.float32),
                         np.array(cs_list, dtype=np.float32),
                     ))
+                # Deserialize graph features
+                for nf_list, gf_list in graph_serial:
+                    all_node_features.append(np.array(nf_list, dtype=np.float32))
+                    all_global_features.append(np.array(gf_list, dtype=np.float32))
                 total_turns += turns
                 if winner_str in ('None', 'null'):
                     winners[None] = winners.get(None, 0) + 1
@@ -831,6 +892,8 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
                 # Save every 10 games
                 if output_dir is not None and games_done % 10 == 0:
                     save_records(all_records, output_dir, quiet=True)
+                    if with_graph_features and all_node_features:
+                        _save_graph_features(all_node_features, all_global_features, output_dir)
                     with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
                         json.dump({
                             'games_completed': games_done,
@@ -844,6 +907,8 @@ def generate_expert_games(bc_path, num_games, search_depth=2, dice_sample_size=5
         # Final save
         if output_dir is not None:
             save_records(all_records, output_dir, quiet=True)
+            if with_graph_features and all_node_features:
+                _save_graph_features(all_node_features, all_global_features, output_dir)
             with open(os.path.join(output_dir, '_progress.json'), 'w') as f:
                 json.dump({
                     'games_completed': games_done,
@@ -1088,6 +1153,24 @@ def generate_games(checkpoint_path, num_games, num_simulations=400,
     return all_records, stats
 
 
+def _save_graph_features(node_features_list, global_features_list, output_dir):
+    """Save graph features (node + global) for GNN training.
+
+    Accepts either a list of individual arrays or a pre-stacked numpy array.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if isinstance(node_features_list, np.ndarray):
+        nf = node_features_list
+    else:
+        nf = np.array(node_features_list, dtype=np.float32)
+    if isinstance(global_features_list, np.ndarray):
+        gf = global_features_list
+    else:
+        gf = np.array(global_features_list, dtype=np.float32)
+    np.save(os.path.join(output_dir, 'node_features.npy'), nf)
+    np.save(os.path.join(output_dir, 'global_features.npy'), gf)
+
+
 def save_records(records, output_dir, quiet=False):
     """Save self-play records to disk."""
     os.makedirs(output_dir, exist_ok=True)
@@ -1113,6 +1196,18 @@ def load_records(data_dir):
     policies = np.load(os.path.join(data_dir, 'policies.npy'))
     values = np.load(os.path.join(data_dir, 'values.npy'))
     return features, policies, values
+
+
+def load_graph_records(data_dir):
+    """Load graph features (node + global) for GNN training.
+
+    Returns:
+        node_features: [N, 54, 18] float32
+        global_features: [N, 76] float32
+    """
+    nf = np.load(os.path.join(data_dir, 'node_features.npy'))
+    gf = np.load(os.path.join(data_dir, 'global_features.npy'))
+    return nf, gf
 
 
 def save_ranking_records(ranking_records, output_dir):
@@ -1238,6 +1333,301 @@ def _load_human_data(parquet_dir, feature_names, max_samples=None):
     return features, policies, values
 
 
+def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
+               batch_size=2048, lr=1e-3, value_weight=1.0,
+               label_smoothing=0.0, scheduler='cosine',
+               dropout=0.2, gnn_dims=None, edge_dropout=0.1,
+               resume_training=None):
+    """Train GNN (CatanGNNet) on graph features.
+
+    Loads node_features.npy [N, 54, 18] and global_features.npy [N, 76]
+    from data_dirs. Creates a fresh GNN and trains with MSE value + CE policy loss.
+    """
+    import gc
+
+    # Pick best available device
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+    # Parse GNN dimensions
+    if gnn_dims is None:
+        gnn_dim, global_dim, body_dim = 32, 64, 96
+    else:
+        gnn_dim, global_dim, body_dim = gnn_dims
+
+    # Load graph features from all data dirs
+    all_node_features = []
+    all_global_features = []
+    all_policies = []
+    all_values = []
+    for d in data_dirs:
+        nf_path = os.path.join(d, 'node_features.npy')
+        gf_path = os.path.join(d, 'global_features.npy')
+        if not os.path.exists(nf_path) or not os.path.exists(gf_path):
+            raise FileNotFoundError(
+                f"GNN training requires node_features.npy and global_features.npy in {d}. "
+                f"Generate with: python -m robottler.az_selfplay expert --with-graph-features "
+                f"or python -m datasets.extract_gnn_features")
+        nf, gf = load_graph_records(d)
+        all_node_features.append(nf)
+        all_global_features.append(gf)
+
+        # Load values (required)
+        val_path = os.path.join(d, 'values.npy')
+        if not os.path.exists(val_path):
+            raise FileNotFoundError(f"values.npy not found in {d}")
+        v = np.load(val_path)
+        all_values.append(v)
+
+        # Load policies if available (human game data has no policy labels)
+        pol_path = os.path.join(d, 'policies.npy')
+        if os.path.exists(pol_path):
+            p = np.load(pol_path)
+        else:
+            p = np.zeros((len(v), ACTION_SPACE_SIZE), dtype=np.float32)
+            print(f"  Note: no policies.npy in {d} — value-only training for this dir")
+        all_policies.append(p)
+
+    node_features = np.concatenate(all_node_features).astype(np.float32)
+    del all_node_features
+    global_features = np.concatenate(all_global_features).astype(np.float32)
+    del all_global_features
+    policies = np.concatenate(all_policies).astype(np.float32)
+    del all_policies
+    values = np.concatenate(all_values).astype(np.float32)
+    del all_values
+
+    n_total = len(values)
+    print(f"GNN training data: {n_total} samples from {len(data_dirs)} dir(s)")
+    print(f"  Node features: {node_features.shape}")
+    print(f"  Global features: {global_features.shape}")
+    print(f"  Value distribution: mean={values.mean():.3f}, std={values.std():.3f}")
+
+    # Compute normalization stats (per-feature mean/std)
+    # Node features: compute over [N*54, 18] (flatten node dimension)
+    nf_flat = node_features.reshape(-1, NODE_FEAT_DIM)
+    node_feat_means = nf_flat.mean(axis=0).astype(np.float32)
+    node_feat_stds = nf_flat.std(axis=0).astype(np.float32)
+    node_feat_stds[node_feat_stds < 1e-6] = 1.0  # avoid div by zero
+    del nf_flat
+
+    global_feat_means = global_features.mean(axis=0).astype(np.float32)
+    global_feat_stds = global_features.std(axis=0).astype(np.float32)
+    global_feat_stds[global_feat_stds < 1e-6] = 1.0
+
+    # Normalize in-place
+    node_features = (node_features - node_feat_means) / node_feat_stds
+    global_features = (global_features - global_feat_means) / global_feat_stds
+
+    # Create fresh GNN
+    net = CatanGNNet(
+        node_feat_dim=NODE_FEAT_DIM,
+        global_feat_dim=GLOBAL_FEAT_DIM,
+        num_actions=ACTION_SPACE_SIZE,
+        gnn_dim=gnn_dim,
+        global_dim=global_dim,
+        body_dim=body_dim,
+        gnn_layers=2,
+        dropout=dropout,
+        edge_dropout=edge_dropout,
+    )
+    total_params = sum(p.numel() for p in net.parameters())
+    print(f"  GNN: gnn_dim={gnn_dim}, global_dim={global_dim}, body_dim={body_dim}, "
+          f"dropout={dropout}, edge_dropout={edge_dropout}, {total_params:,} params")
+    print(f"  Data/param ratio: {n_total/total_params:.1f}:1")
+
+    net.to(device)
+    net.train()
+    print(f"  Training on device: {device}")
+
+    # Train/val split
+    n_val = max(1, int(n_total * 0.1))
+    n_train = n_total - n_val
+    perm = torch.randperm(n_total)
+    train_idx = perm[:n_train]
+    val_idx = perm[n_train:]
+    del perm
+
+    # Move to device
+    _nf = torch.from_numpy(node_features)
+    train_nf = _nf[train_idx].to(device)
+    val_nf = _nf[val_idx].to(device)
+    del _nf, node_features; gc.collect()
+
+    _gf = torch.from_numpy(global_features)
+    train_gf = _gf[train_idx].to(device)
+    val_gf = _gf[val_idx].to(device)
+    del _gf, global_features; gc.collect()
+
+    _pol = torch.from_numpy(policies)
+    train_pol = _pol[train_idx].to(device)
+    val_pol = _pol[val_idx].to(device)
+    del _pol, policies; gc.collect()
+
+    _val = torch.from_numpy(values)
+    train_val = _val[train_idx].to(device)
+    val_val = _val[val_idx].to(device)
+    del _val, values, train_idx, val_idx; gc.collect()
+
+    print(f"  {n_train} train + {n_val} val samples on {device}")
+
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
+    if scheduler == 'cosine':
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    else:
+        lr_scheduler = None
+
+    # Resume support
+    start_epoch = 0
+    best_val_loss = float('inf')
+    best_state_dict = None
+    patience_counter = 0
+    history = []
+    train_ckpt_path = output_path.replace('.pt', '_training.pt')
+
+    if resume_training is not None and os.path.exists(resume_training):
+        print(f"  Resuming training from {resume_training}")
+        resume_ckpt = torch.load(resume_training, map_location='cpu', weights_only=False)
+        net.load_state_dict(resume_ckpt['model_state_dict'])
+        net.to(device)
+        if 'optimizer_state_dict' in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
+        if 'lr_scheduler_state_dict' in resume_ckpt and lr_scheduler is not None:
+            lr_scheduler.load_state_dict(resume_ckpt['lr_scheduler_state_dict'])
+        start_epoch = resume_ckpt.get('epoch', 0) + 1
+        best_val_loss = resume_ckpt.get('best_val_loss', float('inf'))
+        if 'best_state_dict' in resume_ckpt:
+            best_state_dict = resume_ckpt['best_state_dict']
+        patience_counter = resume_ckpt.get('patience_counter', 0)
+        history = resume_ckpt.get('training_history', [])
+        print(f"  Resuming from epoch {start_epoch}/{epochs} "
+              f"(best_val_loss={best_val_loss:.4f}, patience={patience_counter}/20)")
+        del resume_ckpt
+
+    patience = 20
+
+    def _gnn_loss(nf_b, gf_b, pol_b, val_b):
+        """Compute GNN loss on a batch."""
+        v_pred, logits = net(nf_b, gf_b)
+        v_pred = v_pred.squeeze(-1)
+        v_loss = F.mse_loss(v_pred, val_b)
+        has_policy = pol_b.sum(dim=-1) > 0
+        if has_policy.any():
+            sp_logits = logits[has_policy]
+            sp_policy = pol_b[has_policy]
+            if label_smoothing > 0:
+                n_classes = sp_policy.shape[-1]
+                sp_policy = (1 - label_smoothing) * sp_policy + label_smoothing / n_classes
+            log_probs = F.log_softmax(sp_logits, dim=-1).clamp(min=-100.0)
+            p_loss = -(sp_policy * log_probs).sum(dim=-1).mean()
+        else:
+            p_loss = torch.tensor(0.0, device=nf_b.device)
+        return value_weight * v_loss + p_loss, v_loss, p_loss
+
+    for epoch in range(start_epoch, epochs):
+        net.train()
+        total_loss = 0.0
+        total_v_loss = 0.0
+        total_p_loss = 0.0
+        n_batches = 0
+
+        perm = torch.randperm(n_train, device=device)
+
+        for start in range(0, n_train, batch_size):
+            idx = perm[start:start + batch_size]
+            loss, v_loss, p_loss = _gnn_loss(
+                train_nf[idx], train_gf[idx], train_pol[idx], train_val[idx])
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_v_loss += v_loss.item()
+            total_p_loss += p_loss.item()
+            n_batches += 1
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+        avg_loss = total_loss / n_batches
+        avg_v = total_v_loss / n_batches
+        avg_p = total_p_loss / n_batches
+
+        # Validation
+        net.eval()
+        with torch.no_grad():
+            val_loss, val_v, val_p = _gnn_loss(val_nf, val_gf, val_pol, val_val)
+            val_loss_val = val_loss.item()
+            val_v_val = val_v.item()
+            val_p_val = val_p.item()
+
+        hist_entry = {
+            'epoch': epoch, 'loss': avg_loss, 'v_loss': avg_v, 'p_loss': avg_p,
+            'val_loss': val_loss_val, 'val_v_loss': val_v_val, 'val_p_loss': val_p_val,
+        }
+        history.append(hist_entry)
+
+        if (epoch + 1) % 2 == 0 or epoch == 0:
+            print(f"  Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f} "
+                  f"(v={avg_v:.4f}, p={avg_p:.4f}) | "
+                  f"val={val_loss_val:.4f} (v={val_v_val:.4f}, p={val_p_val:.4f})")
+
+        # Early stopping
+        if val_loss_val < best_val_loss:
+            best_val_loss = val_loss_val
+            best_state_dict = {k: v.clone() for k, v in net.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  Early stopping at epoch {epoch+1} "
+                      f"(val loss {val_loss_val:.4f} vs best {best_val_loss:.4f})")
+                break
+
+        # Save training checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            _save_ckpt = {
+                'model_state_dict': net.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch,
+                'best_val_loss': best_val_loss,
+                'best_state_dict': best_state_dict,
+                'patience_counter': patience_counter,
+                'training_history': history,
+            }
+            if lr_scheduler is not None:
+                _save_ckpt['lr_scheduler_state_dict'] = lr_scheduler.state_dict()
+            torch.save(_save_ckpt, train_ckpt_path)
+            del _save_ckpt
+
+    # Clean up training checkpoint
+    if os.path.exists(train_ckpt_path):
+        os.remove(train_ckpt_path)
+
+    # Restore best model
+    if best_state_dict is not None:
+        net.load_state_dict(best_state_dict)
+        best_epoch = min(history, key=lambda h: h.get('val_loss', float('inf')))
+        print(f"  Restored best model from epoch {best_epoch['epoch']+1} "
+              f"(val_loss={best_val_loss:.4f})")
+
+    net.to('cpu').eval()
+    save_checkpoint_gnn(
+        net, optimizer, 1,
+        node_feat_means, node_feat_stds,
+        global_feat_means, global_feat_stds,
+        output_path,
+        extra={'training_history': history, 'num_samples': n_total,
+               'best_val_loss': best_val_loss},
+    )
+    print(f"Saved GNN checkpoint to {output_path}")
+    return {'history': history, 'iteration': 1, 'num_samples': n_total}
+
+
 def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                   batch_size=256, lr=1e-4, value_weight=1.0,
                   human_data_dir=None, human_mix_ratio=0.5,
@@ -1247,7 +1637,8 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                   resume_training=None,
                   loss_asymmetry=0.0, negative_oversample=0.0,
                   ranking_data_dirs=None, ranking_weight=1.0,
-                  ranking_margin=0.3):
+                  ranking_margin=0.3,
+                  gnn=False, gnn_dims=None, edge_dropout=0.1):
     """Train AlphaZero network on self-play data, optionally mixed with human data.
 
     Args:
@@ -1294,10 +1685,23 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
         ranking_margin: Margin for MarginRankingLoss (default 0.3). The network
             must predict at least this gap between better and worse moves.
             Sweep values: 0.1 (conservative), 0.3 (moderate), 0.5 (aggressive).
+        gnn: If True, train a GNN (CatanGNNet) instead of MLP (CatanAlphaZeroNet).
+            Requires node_features.npy and global_features.npy in data_dirs.
+        gnn_dims: Tuple of (gnn_dim, global_dim, body_dim) for GNN architecture.
+            Default (32, 64, 96) = ~45K params.
+        edge_dropout: Edge dropout rate for GNN DropEdge regularization (default 0.1).
 
     Returns:
         training stats dict
     """
+    if gnn:
+        return _train_gnn(
+            checkpoint_path, data_dirs, output_path, epochs=epochs,
+            batch_size=batch_size, lr=lr, value_weight=value_weight,
+            label_smoothing=label_smoothing, scheduler=scheduler,
+            dropout=dropout, gnn_dims=gnn_dims, edge_dropout=edge_dropout,
+            resume_training=resume_training,
+        )
     # Pick best available device
     if torch.backends.mps.is_available():
         device = torch.device('mps')
@@ -2153,7 +2557,8 @@ def main():
 
     # Train
     train_parser = subparsers.add_parser('train', help='Train on self-play data')
-    train_parser.add_argument('--checkpoint', required=True)
+    train_parser.add_argument('--checkpoint', default=None,
+                              help='Network checkpoint (required for MLP, optional for --gnn)')
     train_parser.add_argument('--data-dir', nargs='+', required=True)
     train_parser.add_argument('--output', required=True)
     train_parser.add_argument('--epochs', type=int, default=5)
@@ -2198,6 +2603,14 @@ def main():
     train_parser.add_argument('--ranking-margin', type=float, default=0.3,
                               help='Margin for MarginRankingLoss (default: 0.3). '
                                    'Sweep: 0.1 (conservative), 0.3 (moderate), 0.5 (aggressive)')
+    train_parser.add_argument('--gnn', action='store_true',
+                              help='Train a GNN (CatanGNNet) instead of MLP. '
+                                   'Requires node_features.npy and global_features.npy in data dirs.')
+    train_parser.add_argument('--gnn-dims', default=None,
+                              help='GNN dimensions as "gnn_dim,global_dim,body_dim" '
+                                   '(e.g., "32,64,96"). Default: 32,64,96 (~45K params).')
+    train_parser.add_argument('--edge-dropout', type=float, default=0.1,
+                              help='Edge dropout (DropEdge) rate for GNN training (default 0.1).')
 
     # Expert iteration data generation
     expert_parser = subparsers.add_parser('expert',
@@ -2219,6 +2632,10 @@ def main():
                                     'at each decision point with the blend function. '
                                     'Saves ranking_child_features.npy, ranking_child_scores.npy, '
                                     'ranking_offsets.npy for pairwise ranking loss training.')
+    expert_parser.add_argument('--with-graph-features', action='store_true',
+                               help='Extract per-node [54, 18] and global [76] features '
+                                    'at each decision point for GNN training. '
+                                    'Saves node_features.npy and global_features.npy.')
 
     # Evaluate
     eval_parser = subparsers.add_parser('evaluate', help='Evaluate new vs old')
@@ -2304,14 +2721,20 @@ def main():
             workers=args.workers,
             distill_values=args.distill_values,
             with_ranking=args.with_ranking,
+            with_graph_features=args.with_graph_features,
         )
         save_records(records, args.output_dir)
         print(f"Stats: {stats}")
 
     elif args.command == 'train':
+        if not args.gnn and args.checkpoint is None:
+            parser.error("--checkpoint is required for MLP training (use --gnn for GNN)")
         body_dims = None
         if args.body_dims:
             body_dims = tuple(int(x) for x in args.body_dims.split(','))
+        gnn_dims = None
+        if hasattr(args, 'gnn_dims') and args.gnn_dims:
+            gnn_dims = tuple(int(x) for x in args.gnn_dims.split(','))
         train_on_data(
             args.checkpoint, args.data_dir, args.output,
             epochs=args.epochs, batch_size=args.batch_size,
@@ -2329,6 +2752,8 @@ def main():
             ranking_data_dirs=args.ranking_data,
             ranking_weight=args.ranking_weight,
             ranking_margin=args.ranking_margin,
+            gnn=args.gnn, gnn_dims=gnn_dims,
+            edge_dropout=args.edge_dropout,
         )
 
     elif args.command == 'evaluate':

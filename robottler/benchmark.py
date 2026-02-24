@@ -662,7 +662,7 @@ def run_bb_search_gauntlet(bc_model_path, num_games, vps_to_win=10,
         label_parts.append("fog" + ("" if use_counting else "-nocounting"))
 
     label = f"BB-Search ({', '.join(label_parts)})"
-    opponents = ["random", "weighted", "value", "alphabeta"]
+    opponents = ["alphabeta"]  # TODO: restore ["random", "weighted", "value", "alphabeta"]
 
     if dice_sample_size is not None:
         label_parts.append(f"dice={dice_sample_size}")

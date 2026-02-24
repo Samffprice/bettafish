@@ -26,6 +26,11 @@ from catanatron.gym.envs.catanatron_env import (
 from robottler.alphazero_net import (
     CatanAlphaZeroNet, load_checkpoint,
 )
+from robottler.gnn_net import (
+    CatanGNNet, NODE_FEAT_DIM, GLOBAL_FEAT_DIM,
+    bb_fill_node_features, bb_fill_global_features,
+    load_checkpoint_gnn,
+)
 from robottler.bitboard.convert import game_to_bitboard, DEV_ID_TO_NAME
 from robottler.bitboard.movegen import bb_generate_actions
 from robottler.bitboard.actions import bb_apply_action
@@ -34,6 +39,20 @@ from robottler.bitboard.state import (
     PS_RESOURCE_START, PS_RESOURCE_END,
     PS_KNIGHT_HAND, PS_YOP_HAND, PS_MONO_HAND, PS_RB_HAND, PS_VP_HAND,
 )
+
+
+class _NodeProdHolder:
+    """Lightweight stand-in for FeatureIndexer when only node_prod is needed (GNN path)."""
+    __slots__ = ['node_prod', '_catan_map']
+    def __init__(self, catan_map):
+        from robottler.bitboard.features import _build_node_prod
+        self._catan_map = catan_map
+        self.node_prod = _build_node_prod(catan_map)
+    def update_map(self, catan_map):
+        if catan_map is not self._catan_map:
+            from robottler.bitboard.features import _build_node_prod
+            self._catan_map = catan_map
+            self.node_prod = _build_node_prod(catan_map)
 
 
 # Dice probabilities
@@ -165,13 +184,13 @@ class BBMCTSPlayer(Player):
                  num_simulations=800, c_puct=1.4, time_limit=None,
                  dirichlet_alpha=0.3, dirichlet_weight=0.25,
                  temperature=0.0, is_bot=True, leaf_value_fn=None,
-                 leaf_use_policy=True, dice_top_k=0):
+                 leaf_use_policy=True, dice_top_k=0, leaf_depth1=None,
+                 is_gnn=False, node_feat_means=None, node_feat_stds=None,
+                 global_feat_means=None, global_feat_stds=None):
         super().__init__(color, is_bot)
         self.az_net = az_net
         self.fi = feature_indexer
-        self.means = torch.tensor(feature_means, dtype=torch.float32)
-        self.stds = torch.tensor(feature_stds, dtype=torch.float32)
-        self.n_features = len(feature_means)
+        self.is_gnn = is_gnn
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.time_limit = time_limit
@@ -181,6 +200,27 @@ class BBMCTSPlayer(Player):
         self.leaf_value_fn = leaf_value_fn
         self.leaf_use_policy = leaf_use_policy
         self.dice_top_k = dice_top_k
+        self.leaf_depth1 = leaf_depth1  # None, "neural", "heuristic_select", "heuristic_rank"
+
+        if is_gnn:
+            # GNN normalization stats
+            self._node_means = torch.tensor(node_feat_means, dtype=torch.float32)
+            self._node_stds = torch.tensor(node_feat_stds, dtype=torch.float32)
+            self._global_means = torch.tensor(global_feat_means, dtype=torch.float32)
+            self._global_stds = torch.tensor(global_feat_stds, dtype=torch.float32)
+            # GNN pre-allocated buffers
+            self._node_buf = np.zeros((54, NODE_FEAT_DIM), dtype=np.float32)
+            self._global_buf = np.zeros(GLOBAL_FEAT_DIM, dtype=np.float32)
+            self._node_tensor = torch.zeros(1, 54, NODE_FEAT_DIM, dtype=torch.float32)
+            self._global_tensor = torch.zeros(1, GLOBAL_FEAT_DIM, dtype=torch.float32)
+        else:
+            # MLP normalization stats
+            self.means = torch.tensor(feature_means, dtype=torch.float32)
+            self.stds = torch.tensor(feature_stds, dtype=torch.float32)
+            self.n_features = len(feature_means)
+            # MLP pre-allocated buffers
+            self._feat_buf = np.zeros(self.n_features, dtype=np.float32)
+            self._feat_tensor = torch.zeros(1, self.n_features, dtype=torch.float32)
 
         # Precompute top-k dice rolls if requested
         if dice_top_k > 0:
@@ -195,11 +235,18 @@ class BBMCTSPlayer(Player):
         self._diag_sim_depths = []    # per-simulation depths within current search
         self._diag_snapshots = []     # convergence snapshots (leader at each checkpoint)
 
-        # Pre-allocate buffers
-        self._feat_buf = np.zeros(self.n_features, dtype=np.float32)
-        self._feat_tensor = torch.zeros(1, self.n_features, dtype=torch.float32)
+        # Shared action mask buffers
         self._mask_buf = np.zeros(ACTION_SPACE_SIZE, dtype=bool)
         self._mask_tensor = torch.zeros(1, ACTION_SPACE_SIZE, dtype=torch.bool)
+
+        # Depth-1 leaf search buffers (MLP only, separate from main buffers)
+        if not is_gnn and leaf_depth1 in ("neural", "heuristic_select"):
+            self._d1_feat_buf = np.zeros(self.n_features, dtype=np.float32)
+            self._d1_feat_tensor = torch.zeros(1, self.n_features, dtype=torch.float32)
+
+        # Lazy-loaded heuristic for depth-1 modes
+        if leaf_depth1 in ("heuristic_select", "heuristic_rank"):
+            self._d1_heuristic = None  # loaded on first use
 
     def decide(self, game, playable_actions):
         if len(playable_actions) == 1:
@@ -358,15 +405,6 @@ class BBMCTSPlayer(Player):
 
         # --- Standard AZ network path (leaf_value_fn overrides value below if set) ---
 
-        # Extract features into pre-allocated buffer
-        self._feat_buf[:] = 0.0
-        bb_fill_feature_vector(bb, self.color, self._feat_buf, self.fi)
-
-        # Normalize into pre-allocated tensor (no copy — write directly)
-        ft = self._feat_tensor
-        ft[0] = torch.from_numpy(self._feat_buf)
-        ft[0].sub_(self.means).div_(self.stds)
-
         # Build action mask + collect indices in ONE pass
         self._mask_buf[:] = False
         action_indices = []  # (action, space_index) pairs
@@ -382,15 +420,45 @@ class BBMCTSPlayer(Player):
         mt = self._mask_tensor
         np.copyto(mt.numpy()[0], self._mask_buf)
 
-        # Forward pass
-        with torch.inference_mode():
-            value, policy = self.az_net.predict(ft, mt)
+        if self.is_gnn:
+            # GNN inference path
+            self._node_buf[:] = 0.0
+            self._global_buf[:] = 0.0
+            bb_fill_node_features(bb, self.color, self._node_buf, self.fi.node_prod)
+            bb_fill_global_features(bb, self.color, self._global_buf)
+
+            nt = self._node_tensor
+            nt[0] = torch.from_numpy(self._node_buf)
+            nt[0].sub_(self._node_means).div_(self._node_stds)
+
+            gt = self._global_tensor
+            gt[0] = torch.from_numpy(self._global_buf)
+            gt[0].sub_(self._global_means).div_(self._global_stds)
+
+            with torch.inference_mode():
+                value, policy = self.az_net.predict(nt, gt, mt)
+        else:
+            # MLP inference path
+            self._feat_buf[:] = 0.0
+            bb_fill_feature_vector(bb, self.color, self._feat_buf, self.fi)
+
+            ft = self._feat_tensor
+            ft[0] = torch.from_numpy(self._feat_buf)
+            ft[0].sub_(self.means).div_(self.stds)
+
+            with torch.inference_mode():
+                value, policy = self.az_net.predict(ft, mt)
 
         value = value.item()
 
         # Override value with external leaf function (keep AZ policy priors)
         if self.leaf_value_fn is not None:
             value = self.leaf_value_fn(bb, self.color)
+        # Depth-1 leaf search: 1-ply minimax for better leaf evaluation
+        elif self.leaf_depth1 is not None and len(actions) > 1:
+            d1_value = self._depth1_evaluate(bb, actions)
+            if d1_value is not None:
+                value = d1_value
         policy_np = policy[0].numpy()
 
         # Build children with priors from the SAME index pass
@@ -552,6 +620,132 @@ class BBMCTSPlayer(Player):
         for i, (action, child) in enumerate(node.children):
             child.prior = (1 - eps) * child.prior + eps * noise[i]
 
+    # ------------------------------------------------------------------
+    # Depth-1 leaf search: 1-ply minimax at MCTS leaves
+    # ------------------------------------------------------------------
+
+    def _depth1_evaluate(self, bb_state, actions):
+        """1-ply minimax at an MCTS leaf for better position evaluation.
+
+        Instead of evaluating the current position with the neural net,
+        generate all legal actions, apply each one, evaluate the resulting
+        child positions, and take max (our turn) or min (opponent's turn).
+
+        Modes:
+          "neural": AZ net evaluates each child, take max/min
+          "heuristic_select": heuristic ranks children, AZ net evaluates best
+          "heuristic_rank": heuristic evaluates children, rank-normalize to [-1,+1]
+        """
+        is_our_turn = bb_state.colors[bb_state.current_player_idx] == self.color
+
+        # Filter out stochastic actions (ROLL/BUY_DEV are chance nodes, not
+        # meaningful targets for 1-ply evaluation)
+        det_actions = [a for a in actions if a.action_type not in STOCHASTIC_ACTIONS]
+        if not det_actions:
+            return None
+
+        mode = self.leaf_depth1
+        if mode == "neural":
+            return self._depth1_neural(bb_state, det_actions, is_our_turn)
+        elif mode == "heuristic_select":
+            return self._depth1_heuristic_select(bb_state, det_actions, is_our_turn)
+        elif mode == "heuristic_rank":
+            return self._depth1_heuristic_rank(bb_state, det_actions, is_our_turn)
+        return None
+
+    def _depth1_neural(self, bb_state, actions, is_our_turn):
+        """Evaluate all children with AZ neural net, take max/min."""
+        best_value = float('-inf') if is_our_turn else float('inf')
+        for action in actions:
+            child = bb_state.copy()
+            bb_apply_action(child, action)
+            val = self._neural_eval_child(child)
+            if is_our_turn:
+                if val > best_value:
+                    best_value = val
+            else:
+                if val < best_value:
+                    best_value = val
+        return best_value
+
+    def _depth1_heuristic_select(self, bb_state, actions, is_our_turn):
+        """Heuristic ranks children, neural evaluates the best one.
+
+        Uses the heuristic's strength (comparing siblings) while keeping
+        the neural net's scale-compatible values for MCTS backpropagation.
+        The normalization problem that killed exp #20 doesn't apply because
+        we never backpropagate raw heuristic values — only the neural
+        evaluation of the heuristic-selected best child.
+        """
+        from robottler.search_player import _bb_heuristic
+
+        best_h = float('-inf') if is_our_turn else float('inf')
+        best_child_bb = None
+
+        for action in actions:
+            child = bb_state.copy()
+            bb_apply_action(child, action)
+            h = _bb_heuristic(child, self.color, self.fi.node_prod)
+            if is_our_turn:
+                if h > best_h:
+                    best_h = h
+                    best_child_bb = child
+            else:
+                if h < best_h:
+                    best_h = h
+                    best_child_bb = child
+
+        if best_child_bb is None:
+            return None
+        return self._neural_eval_child(best_child_bb)
+
+    def _depth1_heuristic_rank(self, bb_state, actions, is_our_turn):
+        """Heuristic evaluates all children, rank-normalize to [-1, +1].
+
+        Maps the best child to +1, worst to -1, and interpolates linearly.
+        This avoids the absolute-scale normalization problem — we only
+        compare siblings within the same minimax, just like alpha-beta does.
+        """
+        from robottler.search_player import _bb_heuristic
+
+        values = []
+        for action in actions:
+            child = bb_state.copy()
+            bb_apply_action(child, action)
+            h = _bb_heuristic(child, self.color, self.fi.node_prod)
+            values.append(h)
+
+        if len(values) == 1:
+            return 0.0
+
+        min_h = min(values)
+        max_h = max(values)
+        if max_h == min_h:
+            return 0.0  # all children equally valued
+
+        if is_our_turn:
+            best = max(values)
+        else:
+            best = min(values)
+
+        # Normalize: min_h → -1, max_h → +1
+        return 2.0 * (best - min_h) / (max_h - min_h) - 1.0
+
+    def _neural_eval_child(self, child_bb):
+        """Evaluate a child BitboardState with the AZ neural net (value only)."""
+        self._d1_feat_buf[:] = 0.0
+        bb_fill_feature_vector(child_bb, self.color, self._d1_feat_buf, self.fi)
+
+        ft = self._d1_feat_tensor
+        ft[0] = torch.from_numpy(self._d1_feat_buf)
+        ft[0].sub_(self.means).div_(self.stds)
+
+        with torch.inference_mode():
+            value, _ = self.az_net.predict(ft, None)
+        return value.item()
+
+    # ------------------------------------------------------------------
+
     def _sample_action(self, root):
         """Sample action proportional to visit_count^(1/temp)."""
         if not isinstance(root.children, list) or len(root.children) == 0:
@@ -581,11 +775,13 @@ class BBMCTSPlayer(Player):
 def make_bb_mcts_player(color, az_checkpoint_path, catan_map=None,
                         num_simulations=800, c_puct=1.4, temperature=0.0,
                         **kwargs):
-    """Create a BBMCTSPlayer from an AlphaZero checkpoint.
+    """Create a BBMCTSPlayer from an AlphaZero or GNN checkpoint.
+
+    Automatically detects GNN vs MLP from checkpoint metadata.
 
     Args:
         color: Player color
-        az_checkpoint_path: Path to AlphaZero .pt checkpoint
+        az_checkpoint_path: Path to AlphaZero or GNN .pt checkpoint
         catan_map: CatanMap instance (needed for FeatureIndexer).
                    If None, must call player.fi.update_map(map) before decide().
         num_simulations: MCTS simulations per decision
@@ -596,30 +792,54 @@ def make_bb_mcts_player(color, az_checkpoint_path, catan_map=None,
     Returns:
         BBMCTSPlayer instance
     """
-    net, ckpt = load_checkpoint(az_checkpoint_path)
-    feat_names = ckpt['feature_names']
+    # Peek at checkpoint to detect GNN vs MLP
+    ckpt_peek = torch.load(az_checkpoint_path, map_location='cpu', weights_only=False)
+    is_gnn = ckpt_peek.get('is_gnn', False)
+    del ckpt_peek
 
-    # Build feature_index_map: {name: int_index}
-    feature_index_map = {name: i for i, name in enumerate(feat_names)}
-
-    # Need a catan_map for FeatureIndexer; use a default one if not provided
+    # Need a catan_map for FeatureIndexer
     if catan_map is None:
         from catanatron.models.map import build_map, BASE_MAP_TEMPLATE
         catan_map = build_map(BASE_MAP_TEMPLATE)
 
-    fi = FeatureIndexer(feature_index_map, catan_map)
+    if is_gnn:
+        net, ckpt = load_checkpoint_gnn(az_checkpoint_path)
+        # GNN only needs node_prod from the map (not full FeatureIndexer)
+        fi = _NodeProdHolder(catan_map)
 
-    return BBMCTSPlayer(
-        color=color,
-        az_net=net,
-        feature_indexer=fi,
-        feature_means=ckpt['feature_means'],
-        feature_stds=ckpt['feature_stds'],
-        num_simulations=num_simulations,
-        c_puct=c_puct,
-        temperature=temperature,
-        **kwargs,
-    )
+        return BBMCTSPlayer(
+            color=color,
+            az_net=net,
+            feature_indexer=fi,
+            feature_means=None,
+            feature_stds=None,
+            num_simulations=num_simulations,
+            c_puct=c_puct,
+            temperature=temperature,
+            is_gnn=True,
+            node_feat_means=ckpt['node_feat_means'],
+            node_feat_stds=ckpt['node_feat_stds'],
+            global_feat_means=ckpt['global_feat_means'],
+            global_feat_stds=ckpt['global_feat_stds'],
+            **kwargs,
+        )
+    else:
+        net, ckpt = load_checkpoint(az_checkpoint_path)
+        feat_names = ckpt['feature_names']
+        feature_index_map = {name: i for i, name in enumerate(feat_names)}
+        fi = FeatureIndexer(feature_index_map, catan_map)
+
+        return BBMCTSPlayer(
+            color=color,
+            az_net=net,
+            feature_indexer=fi,
+            feature_means=ckpt['feature_means'],
+            feature_stds=ckpt['feature_stds'],
+            num_simulations=num_simulations,
+            c_puct=c_puct,
+            temperature=temperature,
+            **kwargs,
+        )
 
 
 def create_initial_az_checkpoint(value_ckpt_path, output_path):

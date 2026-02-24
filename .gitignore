@@ -1,5 +1,7 @@
-# Datasets (too large for git)
-datasets/
+# Datasets (too large for git, but keep Python scripts)
+datasets/*
+!datasets/*.py
+!datasets/__pycache__
 
 # Game logs (may contain session metadata)
 logs/

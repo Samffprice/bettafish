@@ -338,11 +338,16 @@ class BotInterface:
         """Lazy-load the bitboard blend value function for trade evaluation."""
         if self._bb_value_fn is None:
             from robottler.search_player import make_bb_blended_value_fn
+            # MCTS uses an AZ checkpoint as bc_model_path which can't load
+            # into CatanValueNet — fall back to the default BC model.
+            bc_path = self.bc_model_path
+            if self.bot_type == "mcts":
+                bc_path = "robottler/models/value_net_v2.pt"
             self._bb_value_fn = make_bb_blended_value_fn(
-                self.bc_model_path, blend_weight=self.blend_weight,
+                bc_path, blend_weight=self.blend_weight,
             )
             logger.info(f"Loaded blend value fn for trade eval "
-                        f"(weight={self.blend_weight:.0e})")
+                        f"(weight={self.blend_weight:.0e}, model={bc_path})")
         return self._bb_value_fn
 
     def _get_player(self, color: Color):
@@ -363,6 +368,17 @@ class BotInterface:
                 logger.info(
                     f"Bitboard search bot: depth={self.search_depth}, "
                     f"blend_weight={self.blend_weight:.0e}, dice_sample=5"
+                )
+            elif self.bot_type == "mcts":
+                from robottler.bb_mcts_player import make_bb_mcts_player
+                player = make_bb_mcts_player(
+                    color, self.bc_model_path,
+                    num_simulations=400, c_puct=1.4, temperature=0.0,
+                    dirichlet_alpha=0.0, dirichlet_weight=0.0,
+                )
+                self._player_cache[color] = player
+                logger.info(
+                    f"MCTS bot: checkpoint={self.bc_model_path}, sims=400"
                 )
             elif self.bot_type == "neural":
                 from robottler.value_model import load_value_model
