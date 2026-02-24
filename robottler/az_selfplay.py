@@ -1545,29 +1545,41 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
     def _compute_ranking_loss(position_indices):
         """Compute pairwise ranking loss for a batch of positions.
 
-        For each position, gets value predictions for all child states,
-        then applies MarginRankingLoss on all (better, worse) pairs.
+        Batches all children from all positions into a single forward pass,
+        then splits by position for pairwise loss computation.
         """
+        # Gather all children into one contiguous batch
+        slices = []
+        for pos_idx in position_indices:
+            s = rank_offsets_t[pos_idx]
+            e = rank_offsets_t[pos_idx + 1]
+            if e - s >= 2:
+                slices.append((s, e))
+        if not slices:
+            return torch.tensor(0.0, device=device)
+
+        # Single forward pass for all children
+        all_indices = torch.cat([torch.arange(s, e, device=device) for s, e in slices])
+        all_feats = rank_feats_t[all_indices]
+        all_v, _ = net(all_feats)
+        all_v = all_v.squeeze(-1)
+        all_scores = rank_scores_t[all_indices]
+
+        # Split back by position and compute pairwise losses
         total_rloss = 0.0
         n_pairs = 0
-        for pos_idx in position_indices:
-            start = rank_offsets_t[pos_idx]
-            end = rank_offsets_t[pos_idx + 1]
-            n_children = end - start
-            if n_children < 2:
-                continue
-            feats = rank_feats_t[start:end]
-            scores = rank_scores_t[start:end]
-            # Get value predictions for all children
-            v_pred, _ = net(feats)
-            v_pred = v_pred.squeeze(-1)
+        offset = 0
+        for s, e in slices:
+            n_children = e - s
+            v_pred = all_v[offset:offset + n_children]
+            scores = all_scores[offset:offset + n_children]
+            offset += n_children
             # All pairs: score_diff[i,j] > 0 means i is better than j
-            score_diff = scores.unsqueeze(0) - scores.unsqueeze(1)  # [n, n]
+            score_diff = scores.unsqueeze(0) - scores.unsqueeze(1)
             pred_diff = v_pred.unsqueeze(0) - v_pred.unsqueeze(1)
             mask = score_diff > 0
             if mask.sum() == 0:
                 continue
-            # loss = max(0, margin - (pred_better - pred_worse))
             pair_loss = F.relu(ranking_margin - pred_diff[mask])
             total_rloss = total_rloss + pair_loss.sum()
             n_pairs = n_pairs + mask.sum()
@@ -1599,8 +1611,9 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
     else:
         sample_weights = None
 
-    # Ranking batch size: sample positions per training batch
-    rank_positions_per_batch = min(32, n_rank_positions) if n_rank_positions > 0 else 0
+    # Ranking batch size: sample positions per training batch.
+    # Each position has ~10 children avg, so 64 positions = ~640 children per forward pass.
+    rank_positions_per_batch = min(64, n_rank_positions) if n_rank_positions > 0 else 0
 
     for epoch in range(start_epoch, epochs):
         net.train()
