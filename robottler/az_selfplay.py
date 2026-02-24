@@ -1337,7 +1337,7 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
                batch_size=2048, lr=1e-3, value_weight=1.0,
                label_smoothing=0.0, scheduler='cosine',
                dropout=0.2, gnn_dims=None, edge_dropout=0.1,
-               resume_training=None, max_samples=0):
+               resume_training=None, max_samples=0, gpu_data=False):
     """Train GNN (CatanGNNet) on graph features.
 
     Loads node_features.npy [N, 54, 18] and global_features.npy [N, 76]
@@ -1479,7 +1479,7 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
     net.train()
     print(f"  Training on device: {device}")
 
-    # Train/val split — keep data on CPU, move batches to GPU
+    # Train/val split
     n_val = max(1, int(n_total * 0.1))
     n_train = n_total - n_val
     perm = np.random.permutation(n_total)
@@ -1487,31 +1487,35 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
     val_idx = perm[n_train:]
     del perm
 
-    # CPU tensors (no GPU copy of full dataset)
-    train_nf = torch.from_numpy(node_features[train_idx])
-    val_nf = torch.from_numpy(node_features[val_idx])
+    # Determine data placement: GPU (fast) or CPU (low memory)
+    data_device = device if (gpu_data and device.type in ('cuda', 'mps')) else torch.device('cpu')
+
+    train_nf = torch.from_numpy(node_features[train_idx]).to(data_device)
+    val_nf = torch.from_numpy(node_features[val_idx]).to(data_device)
     del node_features; gc.collect()
 
-    train_gf = torch.from_numpy(global_features[train_idx])
-    val_gf = torch.from_numpy(global_features[val_idx])
+    train_gf = torch.from_numpy(global_features[train_idx]).to(data_device)
+    val_gf = torch.from_numpy(global_features[val_idx]).to(data_device)
     del global_features; gc.collect()
 
-    train_val = torch.from_numpy(values[train_idx])
-    val_val = torch.from_numpy(values[val_idx])
+    train_val = torch.from_numpy(values[train_idx]).to(data_device)
+    val_val = torch.from_numpy(values[val_idx]).to(data_device)
     del values; gc.collect()
 
     if policies is not None:
-        train_pol = torch.from_numpy(policies[train_idx])
-        val_pol = torch.from_numpy(policies[val_idx])
+        train_pol = torch.from_numpy(policies[train_idx]).to(data_device)
+        val_pol = torch.from_numpy(policies[val_idx]).to(data_device)
         del policies; gc.collect()
     else:
         train_pol = None
         val_pol = None
 
     del train_idx, val_idx; gc.collect()
+    if data_device.type != 'cpu':
+        torch.cuda.empty_cache() if data_device.type == 'cuda' else None
 
-    print(f"  {n_train:,} train + {n_val:,} val samples "
-          f"(data on CPU, batches to {device})")
+    data_loc = "GPU" if data_device.type != 'cpu' else "CPU"
+    print(f"  {n_train:,} train + {n_val:,} val samples (data on {data_loc})")
 
     optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
     if scheduler == 'cosine':
@@ -1576,11 +1580,10 @@ def _train_gnn(checkpoint_path, data_dirs, output_path, epochs=200,
         total_p_loss = 0.0
         n_batches = 0
 
-        perm = torch.randperm(n_train)
+        perm = torch.randperm(n_train, device=data_device)
 
         for start in range(0, n_train, batch_size):
             idx = perm[start:start + batch_size]
-            # Move only this batch to device
             nf_b = train_nf[idx].to(device, non_blocking=True)
             gf_b = train_gf[idx].to(device, non_blocking=True)
             val_b = train_val[idx].to(device, non_blocking=True)
@@ -1698,7 +1701,7 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
                   ranking_data_dirs=None, ranking_weight=1.0,
                   ranking_margin=0.3,
                   gnn=False, gnn_dims=None, edge_dropout=0.1,
-                  max_samples=0):
+                  max_samples=0, gpu_data=False):
     """Train AlphaZero network on self-play data, optionally mixed with human data.
 
     Args:
@@ -1761,6 +1764,7 @@ def train_on_data(checkpoint_path, data_dirs, output_path, epochs=5,
             label_smoothing=label_smoothing, scheduler=scheduler,
             dropout=dropout, gnn_dims=gnn_dims, edge_dropout=edge_dropout,
             resume_training=resume_training, max_samples=max_samples,
+            gpu_data=gpu_data,
         )
     # Pick best available device
     if torch.backends.mps.is_available():
@@ -2674,6 +2678,9 @@ def main():
     train_parser.add_argument('--max-samples', type=int, default=0,
                               help='Max training samples (0 = use all). '
                                    'Use 500000-1000000 for Colab T4 to fit in RAM.')
+    train_parser.add_argument('--gpu-data', action='store_true',
+                              help='Store full dataset on GPU for faster training. '
+                                   'Requires enough VRAM (e.g., A100 40GB for 2.5M samples).')
 
     # Expert iteration data generation
     expert_parser = subparsers.add_parser('expert',
@@ -2818,6 +2825,7 @@ def main():
             gnn=args.gnn, gnn_dims=gnn_dims,
             edge_dropout=args.edge_dropout,
             max_samples=args.max_samples,
+            gpu_data=getattr(args, 'gpu_data', False),
         )
 
     elif args.command == 'evaluate':
